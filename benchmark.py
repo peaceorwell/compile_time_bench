@@ -321,13 +321,17 @@ def _run_sample(
             result.second_call_s = time.perf_counter() - t1
             result.kernel_time_s = round(evt_s.elapsed_time(evt_e) / 1000.0, 6)
         elif device == "mlu":
+            evt_s = torch.mlu.Event(enable_timing=True)
+            evt_e = torch.mlu.Event(enable_timing=True)
             torch.mlu.synchronize()
             t1 = time.perf_counter()
+            evt_s.record()
             with torch.no_grad():
                 compiled(*inputs)
+            evt_e.record()
             torch.mlu.synchronize()
             result.second_call_s = time.perf_counter() - t1
-            result.kernel_time_s = result.second_call_s
+            result.kernel_time_s = round(evt_s.elapsed_time(evt_e) / 1000.0, 6)
         else:
             t1 = time.perf_counter()
             with torch.no_grad():
