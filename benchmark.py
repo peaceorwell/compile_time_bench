@@ -363,6 +363,7 @@ def _build_tasks(
     sample_names: list[str],
     device: str,
     backend: str,
+    variants_filter: set[str] | None = None,
 ) -> list[tuple]:
     """
     Build the flat task list from all requested samples.
@@ -372,6 +373,9 @@ def _build_tasks(
 
     Modules that expose get_variant_specs() are expanded into one task per
     variant.  All others produce a single task with fn_kwargs={}.
+
+    If variants_filter is given, only variants whose name is in the set
+    are included.
     """
     import importlib
     tasks = []
@@ -383,7 +387,8 @@ def _build_tasks(
         else:
             specs = [(name, {})]
         for variant_name, fn_kwargs in specs:
-            tasks.append((len(tasks), variant_name, module_path, fn_kwargs, device, backend))
+            if variants_filter is None or variant_name in variants_filter:
+                tasks.append((len(tasks), variant_name, module_path, fn_kwargs, device, backend))
     return tasks
 
 
@@ -402,6 +407,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="Which samples to run (default: all)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel worker processes (default: 1 = sequential)")
+    parser.add_argument("--variants", nargs="+", default=None, metavar="VARIANT",
+                        help="Run only these specific variant names, e.g. "
+                             "elementwise_ni2_no1_sz256_2d_high (default: run all)")
     args = parser.parse_args(argv)
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -414,7 +422,20 @@ def main(argv: list[str] | None = None) -> None:
     logs_dir = Path(args.logs_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    all_tasks = _build_tasks(args.samples, args.device, args.backend)
+    variants_filter = set(args.variants) if args.variants else None
+    all_tasks = _build_tasks(args.samples, args.device, args.backend, variants_filter)
+
+    if variants_filter and not all_tasks:
+        known = _build_tasks(args.samples, args.device, args.backend)
+        known_names = [t[1] for t in known]
+        unmatched = variants_filter - {t[1] for t in known}
+        print(f"[error] No variants matched: {sorted(unmatched)}", file=sys.stderr)
+        print(f"        Available variants in selected samples ({len(known_names)}):", file=sys.stderr)
+        for name in known_names[:10]:
+            print(f"          {name}", file=sys.stderr)
+        if len(known_names) > 10:
+            print(f"          ... ({len(known_names) - 10} more)", file=sys.stderr)
+        sys.exit(1)
     n = len(all_tasks)
 
     print(f"{'Sample':<40} {'Device':<6} {'1st call':>10} {'2nd call':>10} "
