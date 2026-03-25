@@ -102,6 +102,37 @@ def _reset_all_caches() -> None:
         pass
 
 
+# ── warmup ───────────────────────────────────────────────────────────────────
+
+def _warmup(device: str) -> None:
+    """
+    Run one throwaway compilation to trigger all one-time initializations
+    (Inductor/Triton infrastructure JIT, pass-pipeline setup, OS page cache)
+    before any timed case starts.
+
+    Without this, the first measured case pays the full cold-start cost,
+    making single-case runs appear slower than the same case run inside a
+    full batch (where the cost is absorbed by earlier cases).
+
+    A _reset_all_caches() call after warmup ensures the timed cases still
+    start from a clean compilation state.
+
+    Log output is suppressed during warmup so TORCH_LOGS noise doesn't
+    pollute the benchmark output.
+    """
+    import torch.nn as nn
+    _reset_all_caches()
+    # Suppress all logging during the warmup compilation
+    logging.disable(logging.CRITICAL)
+    try:
+        m = torch.compile(nn.Linear(4, 4).to(device))
+        with torch.no_grad():
+            m(torch.randn(4, 4, device=device))
+    finally:
+        logging.disable(logging.NOTSET)
+    _reset_all_caches()
+
+
 # ── logging setup ───────────────────────────────────────────────────────────
 _LOGFMT = "%(name)s | %(levelname)s | %(message)s"
 
@@ -221,6 +252,13 @@ class BenchResult:
     cache_hit: int = 0          # 1 if AOT/FX cache was hit (skipped inductor)
     graph_breaks: int = 0
     frames_compiled: int = 0
+    # ── hardware kernel execution time ──────────────────────────────────────
+    # Measured on a post-compilation call with all Python dispatch overhead
+    # removed as far as possible:
+    #   cuda – torch.cuda.Event elapsed_time (GPU-side clock)
+    #   mlu  – wall clock bracketed by torch.mlu.synchronize()
+    #   cpu  – wall clock (no device-side async)
+    kernel_time_s: float = 0.0
     # error message if compilation failed
     error: str = ""
 
@@ -276,6 +314,34 @@ def _run_sample(
             torch.mlu.synchronize()
         result.second_call_s = time.perf_counter() - t1
 
+        # ── hardware kernel timing ───────────────────────────────────────────
+        # One extra warm pass so any remaining lazy init is done, then time
+        # a single forward with the most precise clock available per device.
+        with torch.no_grad():
+            compiled(*inputs)
+        if device == "cuda":
+            evt_s = torch.cuda.Event(enable_timing=True)
+            evt_e = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            evt_s.record()
+            with torch.no_grad():
+                compiled(*inputs)
+            evt_e.record()
+            torch.cuda.synchronize()
+            result.kernel_time_s = round(evt_s.elapsed_time(evt_e) / 1000.0, 6)
+        elif device == "mlu":
+            torch.mlu.synchronize()
+            tk = time.perf_counter()
+            with torch.no_grad():
+                compiled(*inputs)
+            torch.mlu.synchronize()
+            result.kernel_time_s = round(time.perf_counter() - tk, 6)
+        else:
+            tk = time.perf_counter()
+            with torch.no_grad():
+                compiled(*inputs)
+            result.kernel_time_s = round(time.perf_counter() - tk, 6)
+
         # ── collect compile-phase timings ──
         ct = _read_compile_times()
         result.dynamo_s = ct["dynamo_s"]
@@ -330,6 +396,82 @@ def _worker(task: tuple) -> tuple[int, dict, str]:
 
     result, logs = _run_sample(variant_name, get_fn, device, backend)
     return idx, asdict(result), logs
+
+
+# ── statistics helpers ────────────────────────────────────────────────────────
+
+# Fields excluded from statistical summary (non-numeric or per-case identifiers)
+_STATS_EXCLUDE = {"sample", "device", "error"}
+
+
+def _write_stats(results: list[BenchResult], out_path: Path) -> None:
+    """
+    Compute max / min / avg for every numeric column across all successful
+    results and:
+      1. Append three summary rows to the CSV (after the data rows).
+      2. Print a compact summary table to stdout.
+    """
+    if not results:
+        return
+
+    good = [r for r in results if not r.error]
+    if not good:
+        print("\n[stats] No successful results to summarise.")
+        return
+
+    numeric_fields = [
+        f.name for f in fields(BenchResult)
+        if f.name not in _STATS_EXCLUDE and f.type in ("float", "int")
+    ]
+    # Fall back: detect by actual type of first result
+    if not numeric_fields:
+        numeric_fields = [
+            f.name for f in fields(BenchResult)
+            if f.name not in _STATS_EXCLUDE
+            and isinstance(getattr(good[0], f.name), (int, float))
+        ]
+
+    stats: dict[str, dict[str, float]] = {}
+    for col in numeric_fields:
+        vals = [getattr(r, col) for r in good]
+        stats[col] = {
+            "max": max(vals),
+            "min": min(vals),
+            "avg": sum(vals) / len(vals),
+        }
+
+    # ── append to CSV ────────────────────────────────────────────────────────
+    header = BenchResult.csv_header()
+    with out_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([])  # blank separator
+        for stat_name in ("max", "min", "avg"):
+            row = []
+            for col in header:
+                if col == "sample":
+                    row.append(f"[{stat_name}]")
+                elif col == "device":
+                    row.append("")
+                elif col in stats:
+                    v = stats[col][stat_name]
+                    row.append(f"{v:.6f}" if isinstance(v, float) else v)
+                else:
+                    row.append("")
+            writer.writerow(row)
+
+    # ── print summary table ──────────────────────────────────────────────────
+    col_w = 18
+    label_w = 30
+    print(f"\n{'─' * (label_w + col_w * 3 + 6)}")
+    print(f"{'Statistics':>{label_w}}  {'max':>{col_w}}  {'min':>{col_w}}  {'avg':>{col_w}}")
+    print(f"{'─' * (label_w + col_w * 3 + 6)}")
+    for col in numeric_fields:
+        s = stats[col]
+        is_float = isinstance(s["avg"], float)
+        fmt = f"{{:>{col_w}.6f}}" if is_float else f"{{:>{col_w}}}"
+        print(f"{col:>{label_w}}  {fmt.format(s['max'])}  {fmt.format(s['min'])}  {fmt.format(s['avg'])}")
+    print(f"{'─' * (label_w + col_w * 3 + 6)}")
+    print(f"  (n={len(good)} successful cases)")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -425,6 +567,8 @@ def main(argv: list[str] | None = None) -> None:
     variants_filter = set(args.case_name) if args.case_name else None
     all_tasks = _build_tasks(args.case_type, args.device, args.backend, variants_filter)
 
+    _warmup(args.device)
+
     if variants_filter and not all_tasks:
         known = _build_tasks(args.case_type, args.device, args.backend)
         known_names = [t[1] for t in known]
@@ -493,6 +637,10 @@ def main(argv: list[str] | None = None) -> None:
         for idx in range(n):
             result, _ = ordered_results[idx]
             writer.writerow(result.csv_row())
+
+    # ── compute and append statistics ───────────────────────────────────────
+    all_results = [ordered_results[i][0] for i in range(n)]
+    _write_stats(all_results, out_path)
 
     print(f"\nResults written to: {out_path.resolve()}")
     print(f"Per-sample logs  : {logs_dir.resolve()}/")
