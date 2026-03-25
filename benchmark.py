@@ -10,9 +10,9 @@ Usage
 
 TORCH_LOGS
 ----------
-The script sets  TORCH_LOGS="+dynamo,+aot,+inductor"  before importing torch
-so that PyTorch emits structured log lines for every compilation event.  These
-logs are captured per-sample and written alongside the timing summary.
+The script sets  TORCH_LOGS="dynamo"  before importing torch so that PyTorch
+emits timing log lines for the Dynamo phase.  These logs are captured per-sample
+and written alongside the timing summary.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Callable
 
 # ── TORCH_LOGS must be set BEFORE importing torch ──────────────────────────
-os.environ.setdefault("TORCH_LOGS", "+dynamo,+aot,+inductor")
+os.environ.setdefault("TORCH_LOGS", "dynamo")
 
 import torch
 import torch._dynamo
@@ -51,27 +51,17 @@ except Exception:
     pass
 
 # ── logging setup ───────────────────────────────────────────────────────────
-_TORCH_LOG_NAMESPACES = [
-    "torch._dynamo",
-    "torch._inductor",
-    "torch._functorch",
-    "torch.fx",
-]
-
 _LOGFMT = "%(name)s | %(levelname)s | %(message)s"
 
 
 def _attach_capture_handler(buf: io.StringIO) -> list[logging.Handler]:
-    """Attach a StringIO-backed handler to every relevant torch logger."""
+    """Attach a StringIO-backed handler to the dynamo logger."""
     handler = logging.StreamHandler(buf)
     handler.setFormatter(logging.Formatter(_LOGFMT))
-    handlers = []
-    for ns in _TORCH_LOG_NAMESPACES:
-        lg = logging.getLogger(ns)
-        lg.addHandler(handler)
-        lg.setLevel(logging.DEBUG)
-        handlers.append((lg, handler))
-    return handlers
+    lg = logging.getLogger("torch._dynamo")
+    lg.addHandler(handler)
+    lg.setLevel(logging.INFO)
+    return [(lg, handler)]
 
 
 def _detach_capture_handler(handlers: list) -> None:

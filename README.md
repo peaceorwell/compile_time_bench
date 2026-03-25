@@ -49,14 +49,14 @@ Per-sample `TORCH_LOGS` output is saved to `logs/<sample>.log`.
 
 ## TORCH_LOGS
 
-The script sets `TORCH_LOGS="+dynamo,+aot,+inductor"` before importing torch,
-enabling verbose logging for all three compile phases. The captured log text is
-written to `logs/<sample>.log` for inspection.
+The script sets `TORCH_LOGS="dynamo"` before importing torch, capturing
+Dynamo-phase timing lines. The captured log text is written to
+`logs/<sample>.log` for inspection.
 
 You can override this before running:
 
 ```bash
-TORCH_LOGS="+dynamo,output_code" python benchmark.py
+TORCH_LOGS="+dynamo" python benchmark.py   # verbose dynamo logs
 ```
 
 ## Requirements
