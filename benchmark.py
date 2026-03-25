@@ -295,38 +295,47 @@ def main(argv: list[str] | None = None) -> None:
 
     results: list[BenchResult] = []
 
-    print(f"{'Sample':<16} {'Device':<6} {'1st call':>10} {'2nd call':>10} "
+    print(f"{'Sample':<40} {'Device':<6} {'1st call':>10} {'2nd call':>10} "
           f"{'Dynamo':>10} {'AOT':>10} {'Backend':>10} {'Total cmp':>10}")
-    print("-" * 88)
+    print("-" * 112)
+
+    import importlib
 
     for name in args.samples:
         module_path = SAMPLES[name]
-        import importlib
         mod = importlib.import_module(module_path)
 
-        result, logs = _run_sample(
-            name=name,
-            get_model_and_input=mod.get_model_and_input,
-            device=args.device,
-            backend=args.backend,
-        )
-        results.append(result)
-
-        # Save per-sample TORCH_LOGS
-        (logs_dir / f"{name}.log").write_text(logs, encoding="utf-8")
-
-        if result.error:
-            print(f"{name:<16} ERROR: {result.error}")
+        # If the module exposes get_all_variants(), expand into sub-runs;
+        # otherwise fall back to the single get_model_and_input() entry point.
+        if hasattr(mod, "get_all_variants"):
+            variant_list = mod.get_all_variants()
         else:
-            print(
-                f"{name:<16} {result.device:<6}"
-                f" {result.first_call_s:>10.4f}s"
-                f" {result.second_call_s:>10.4f}s"
-                f" {result.dynamo_s:>10.4f}s"
-                f" {result.aot_s:>10.4f}s"
-                f" {result.backend_s:>10.4f}s"
-                f" {result.total_compile_s:>10.4f}s"
+            variant_list = [(name, mod.get_model_and_input)]
+
+        for variant_name, get_fn in variant_list:
+            result, logs = _run_sample(
+                name=variant_name,
+                get_model_and_input=get_fn,
+                device=args.device,
+                backend=args.backend,
             )
+            results.append(result)
+
+            # Save per-variant TORCH_LOGS
+            (logs_dir / f"{variant_name}.log").write_text(logs, encoding="utf-8")
+
+            if result.error:
+                print(f"{variant_name:<40} ERROR: {result.error}")
+            else:
+                print(
+                    f"{variant_name:<40} {result.device:<6}"
+                    f" {result.first_call_s:>10.4f}s"
+                    f" {result.second_call_s:>10.4f}s"
+                    f" {result.dynamo_s:>10.4f}s"
+                    f" {result.aot_s:>10.4f}s"
+                    f" {result.backend_s:>10.4f}s"
+                    f" {result.total_compile_s:>10.4f}s"
+                )
 
     # ── write CSV ──────────────────────────────────────────────────────────
     out_path = Path(args.output)
