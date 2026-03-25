@@ -252,13 +252,11 @@ class BenchResult:
     cache_hit: int = 0          # 1 if AOT/FX cache was hit (skipped inductor)
     graph_breaks: int = 0
     frames_compiled: int = 0
-    # ── hardware kernel execution time ──────────────────────────────────────
-    # Measured on a post-compilation call with all Python dispatch overhead
-    # removed as far as possible:
-    #   cuda – torch.cuda.Event elapsed_time (GPU-side clock)
-    #   mlu  – wall clock bracketed by torch.mlu.synchronize()
-    #   cpu  – wall clock (no device-side async)
-    kernel_time_s: float = 0.0
+    # ── hardware kernel execution time (milliseconds) ───────────────────────
+    #   cuda – torch.cuda.Event.elapsed_time() (GPU-side clock, ms)
+    #   mlu  – torch.mlu.Event.elapsed_time()  (device-side clock, ms)
+    #   cpu  – wall clock converted to ms
+    kernel_time_ms: float = 0.0
     # error message if compilation failed
     error: str = ""
 
@@ -319,7 +317,7 @@ def _run_sample(
             evt_e.record()
             torch.cuda.synchronize()
             result.second_call_s = time.perf_counter() - t1
-            result.kernel_time_s = round(evt_s.elapsed_time(evt_e) / 1000.0, 6)
+            result.kernel_time_ms = round(evt_s.elapsed_time(evt_e), 6)
         elif device == "mlu":
             evt_s = torch.mlu.Event(enable_timing=True)
             evt_e = torch.mlu.Event(enable_timing=True)
@@ -331,13 +329,13 @@ def _run_sample(
             evt_e.record()
             torch.mlu.synchronize()
             result.second_call_s = time.perf_counter() - t1
-            result.kernel_time_s = round(evt_s.elapsed_time(evt_e) / 1000.0, 6)
+            result.kernel_time_ms = round(evt_s.elapsed_time(evt_e), 6)
         else:
             t1 = time.perf_counter()
             with torch.no_grad():
                 compiled(*inputs)
             result.second_call_s = time.perf_counter() - t1
-            result.kernel_time_s = result.second_call_s
+            result.kernel_time_ms = round(result.second_call_s * 1000.0, 6)
 
         # ── collect compile-phase timings ──
         ct = _read_compile_times()
