@@ -31,7 +31,7 @@ For each sample model the benchmark records:
 ## Usage
 
 ```bash
-# Run all samples on CPU (default)
+# Run all case types on CPU (default)
 python benchmark.py
 
 # Run on CUDA
@@ -40,15 +40,27 @@ python benchmark.py --device cuda
 # Run on MLU (Cambricon)
 python benchmark.py --device mlu
 
-# Run specific samples
-python benchmark.py --samples mlp cnn resnet
+# Run specific case types
+python benchmark.py --case_type mlp cnn resnet
+
+# Run a specific case by name
+python benchmark.py --case_name elementwise_ni2_no1_sz256_2d_high
+
+# Run multiple specific cases
+python benchmark.py --case_name mlp elementwise_ni4_no4_sz32768_3d_hl
+
+# Combine: narrow scope to a type, then pick a case
+python benchmark.py --case_type elementwise --case_name elementwise_ni2_no1_sz256_2d_high
+
+# Parallel execution across N worker processes
+python benchmark.py --workers 4
 
 # Change output path
 python benchmark.py --output results/my_run.csv
 ```
 
 Results are saved to `compile_times.csv` (configurable via `--output`).
-Per-sample `TORCH_LOGS` output is saved to `logs/<sample>.log`.
+Per-case `TORCH_LOGS` output is saved to `logs/<case_name>.log`.
 
 ## TORCH_LOGS
 
