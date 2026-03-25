@@ -304,43 +304,36 @@ def _run_sample(
             torch.mlu.synchronize()
         result.first_call_s = time.perf_counter() - t0
 
-        # ── second call: compiled artifact is reused ──
-        t1 = time.perf_counter()
-        with torch.no_grad():
-            compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
-        result.second_call_s = time.perf_counter() - t1
-
-        # ── hardware kernel timing ───────────────────────────────────────────
-        # One extra warm pass so any remaining lazy init is done, then time
-        # a single forward with the most precise clock available per device.
-        with torch.no_grad():
-            compiled(*inputs)
+        # ── second call: compiled artifact is reused; also measure hardware time ──
+        # cuda  – CUDA events give GPU-side elapsed time, excluding Python overhead
+        # mlu   – wall clock bracketed by torch.mlu.synchronize()
+        # cpu   – plain wall clock (no async)
         if device == "cuda":
             evt_s = torch.cuda.Event(enable_timing=True)
             evt_e = torch.cuda.Event(enable_timing=True)
             torch.cuda.synchronize()
+            t1 = time.perf_counter()
             evt_s.record()
             with torch.no_grad():
                 compiled(*inputs)
             evt_e.record()
             torch.cuda.synchronize()
+            result.second_call_s = time.perf_counter() - t1
             result.kernel_time_s = round(evt_s.elapsed_time(evt_e) / 1000.0, 6)
         elif device == "mlu":
             torch.mlu.synchronize()
-            tk = time.perf_counter()
+            t1 = time.perf_counter()
             with torch.no_grad():
                 compiled(*inputs)
             torch.mlu.synchronize()
-            result.kernel_time_s = round(time.perf_counter() - tk, 6)
+            result.second_call_s = time.perf_counter() - t1
+            result.kernel_time_s = result.second_call_s
         else:
-            tk = time.perf_counter()
+            t1 = time.perf_counter()
             with torch.no_grad():
                 compiled(*inputs)
-            result.kernel_time_s = round(time.perf_counter() - tk, 6)
+            result.second_call_s = time.perf_counter() - t1
+            result.kernel_time_s = result.second_call_s
 
         # ── collect compile-phase timings ──
         ct = _read_compile_times()
