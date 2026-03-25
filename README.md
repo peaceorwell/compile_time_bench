@@ -35,6 +35,9 @@ For each sample model the benchmark records:
 python benchmark.py
 
 # Run on CUDA
+python benchmark.py --device cuda
+
+# Run on MLU (Cambricon)
 python benchmark.py --device mlu
 
 # Run specific samples
