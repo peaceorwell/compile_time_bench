@@ -439,7 +439,7 @@ def main(argv: list[str] | None = None) -> None:
         # progress and sort by idx before writing the CSV.
         workers = min(args.workers, n)
         print(f"[parallel] {n} variants across {workers} workers", flush=True)
-        ctx = mp.get_context("fork")
+        ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as exe:
             future_to_idx = {exe.submit(_worker, task): task[0] for task in all_tasks}
             done = 0
