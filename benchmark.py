@@ -50,6 +50,56 @@ try:
 except Exception:
     pass
 
+# ── per-sample cache reset ──────────────────────────────────────────────────
+
+def _reset_all_caches() -> None:
+    """
+    Fully reset every compilation cache layer before each sample run so that
+    timings reflect a cold compilation, not a cache hit.
+
+    Layers cleared:
+      1. torch._dynamo.reset()
+           – Dynamo in-memory frame/code cache
+           – compilation_time_metrics (timing accumulators)
+      2. PyCodeCache.cache
+           – Inductor in-memory map of {hash -> loaded compiled module}
+           – Without this, identical or similar kernels compiled by earlier
+             samples are reused silently, zeroing inductor_compile_s.
+      3. FxGraphCache (in-memory component)
+           – Inductor's in-memory FX graph cache; disk I/O is already
+             disabled via fx_graph_cache=False but the in-memory dict
+             can still serve hits within a process.
+      4. AOTAutogradCache (in-memory component)
+           – Same rationale as FxGraphCache.
+    """
+    # Layer 1 – Dynamo frame cache + timing metrics
+    torch._dynamo.reset()
+
+    # Layer 2 – Inductor PyCodeCache (compiled .so / Python modules)
+    try:
+        import torch._inductor.codecache as _cc
+        if hasattr(_cc, "PyCodeCache") and hasattr(_cc.PyCodeCache, "cache"):
+            _cc.PyCodeCache.cache.clear()
+    except Exception:
+        pass
+
+    # Layer 3 – Inductor FxGraphCache in-memory store
+    try:
+        import torch._inductor.codecache as _cc
+        if hasattr(_cc, "FxGraphCache") and hasattr(_cc.FxGraphCache, "_cache"):
+            _cc.FxGraphCache._cache.clear()
+    except Exception:
+        pass
+
+    # Layer 4 – AOTAutogradCache in-memory store
+    try:
+        import torch._inductor.codecache as _cc
+        if hasattr(_cc, "AOTAutogradCache") and hasattr(_cc.AOTAutogradCache, "_cache"):
+            _cc.AOTAutogradCache._cache.clear()
+    except Exception:
+        pass
+
+
 # ── logging setup ───────────────────────────────────────────────────────────
 _LOGFMT = "%(name)s | %(levelname)s | %(message)s"
 
@@ -191,8 +241,9 @@ def _run_sample(
     """Compile and run one sample; return (BenchResult, captured_logs)."""
     result = BenchResult(sample=name, device=device)
 
-    # Reset dynamo state so timings are isolated per sample.
-    torch._dynamo.reset()
+    # Full cache reset: Dynamo frame cache, Inductor PyCodeCache,
+    # FxGraphCache, AOTAutogradCache – all layers cleared before each run.
+    _reset_all_caches()
 
     log_buf = io.StringIO()
     handlers = _attach_capture_handler(log_buf)
