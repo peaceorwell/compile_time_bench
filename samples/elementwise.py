@@ -151,35 +151,29 @@ def get_model_and_input(
     return model, inputs
 
 
-def get_all_variants() -> list[tuple[str, Callable]]:
+def get_variant_specs() -> list[tuple[str, dict]]:
     """
-    Return (variant_name, get_model_and_input_fn) for every combination of
+    Return (variant_name, fn_kwargs) pairs for every combination of
     n_inputs × n_outputs × size × bcast_mode.
+
+    fn_kwargs are plain picklable dicts passed directly to
+    get_model_and_input(), suitable for both sequential and parallel
+    execution via multiprocessing.
 
     n_inputs == 1 produces no bcast_mode suffix (1-D tensor, unchanged).
     n_inputs >= 2 produces one variant per bcast_mode in _BCAST_MODES.
     """
-    variants: list[tuple[str, Callable]] = []
-
+    specs: list[tuple[str, dict]] = []
     for ni, no, sz in itertools.product(N_INPUTS_CHOICES, N_OUTPUTS_CHOICES, SIZE_CHOICES):
         if ni == 1:
-            name = f"elementwise_ni{ni}_no{no}_sz{sz}"
-
-            def _make_1(n_inputs=ni, n_outputs=no, size=sz) -> Callable:
-                def _fn(device: str = "cpu"):
-                    return get_model_and_input(n_inputs, n_outputs, size, "no_bcast", device)
-                return _fn
-
-            variants.append((name, _make_1()))
+            specs.append((
+                f"elementwise_ni{ni}_no{no}_sz{sz}",
+                {"n_inputs": ni, "n_outputs": no, "size": sz, "bcast_mode": "no_bcast"},
+            ))
         else:
             for mode_name, _, _ in _BCAST_MODES:
-                name = f"elementwise_ni{ni}_no{no}_sz{sz}_{mode_name}"
-
-                def _make_n(n_inputs=ni, n_outputs=no, size=sz, bm=mode_name) -> Callable:
-                    def _fn(device: str = "cpu"):
-                        return get_model_and_input(n_inputs, n_outputs, size, bm, device)
-                    return _fn
-
-                variants.append((name, _make_n()))
-
-    return variants
+                specs.append((
+                    f"elementwise_ni{ni}_no{no}_sz{sz}_{mode_name}",
+                    {"n_inputs": ni, "n_outputs": no, "size": sz, "bcast_mode": mode_name},
+                ))
+    return specs

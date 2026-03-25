@@ -21,10 +21,12 @@ import argparse
 import csv
 import io
 import logging
+import multiprocessing as mp
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, field, fields
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Callable
 
@@ -300,6 +302,32 @@ def _run_sample(
     return result, logs
 
 
+# ── subprocess worker (module-level so it is picklable) ──────────────────────
+
+def _worker(task: tuple) -> tuple[int, dict, str]:
+    """
+    Entry point for each ProcessPoolExecutor worker.
+
+    task = (idx, variant_name, module_path, fn_kwargs, device, backend)
+
+    All elements are plain picklable values.  The worker imports the sample
+    module (which is a no-op after fork since it is already in sys.modules),
+    rebuilds the get_model_and_input callable from fn_kwargs, and delegates
+    to _run_sample.  Returns (idx, result_as_dict, captured_logs) so the
+    main process can reconstruct a BenchResult and maintain submission order.
+    """
+    idx, variant_name, module_path, fn_kwargs, device, backend = task
+
+    import importlib
+    mod = importlib.import_module(module_path)
+
+    def get_fn(device: str = "cpu"):
+        return mod.get_model_and_input(**fn_kwargs, device=device)
+
+    result, logs = _run_sample(variant_name, get_fn, device, backend)
+    return idx, asdict(result), logs
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 SAMPLES: dict[str, str] = {
@@ -310,6 +338,49 @@ SAMPLES: dict[str, str] = {
     "lstm": "samples.lstm",
     "elementwise": "samples.elementwise",
 }
+
+
+def _print_row(result: BenchResult) -> None:
+    if result.error:
+        print(f"{result.sample:<40} ERROR: {result.error}")
+    else:
+        print(
+            f"{result.sample:<40} {result.device:<6}"
+            f" {result.first_call_s:>10.4f}s"
+            f" {result.second_call_s:>10.4f}s"
+            f" {result.dynamo_s:>10.4f}s"
+            f" {result.aot_s:>10.4f}s"
+            f" {result.backend_s:>10.4f}s"
+            f" {result.total_compile_s:>10.4f}s"
+        )
+
+
+def _build_tasks(
+    sample_names: list[str],
+    device: str,
+    backend: str,
+) -> list[tuple]:
+    """
+    Build the flat task list from all requested samples.
+
+    Each task is a picklable tuple:
+        (idx, variant_name, module_path, fn_kwargs, device, backend)
+
+    Modules that expose get_variant_specs() are expanded into one task per
+    variant.  All others produce a single task with fn_kwargs={}.
+    """
+    import importlib
+    tasks = []
+    for name in sample_names:
+        module_path = SAMPLES[name]
+        mod = importlib.import_module(module_path)
+        if hasattr(mod, "get_variant_specs"):
+            specs = mod.get_variant_specs()
+        else:
+            specs = [(name, {})]
+        for variant_name, fn_kwargs in specs:
+            tasks.append((len(tasks), variant_name, module_path, fn_kwargs, device, backend))
+    return tasks
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -325,6 +396,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--samples", nargs="*", default=list(SAMPLES.keys()),
                         choices=list(SAMPLES.keys()),
                         help="Which samples to run (default: all)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel worker processes (default: 1 = sequential)")
     args = parser.parse_args(argv)
 
     if args.device == "mlu" and not torch.mlu.is_available():
@@ -334,57 +407,60 @@ def main(argv: list[str] | None = None) -> None:
     logs_dir = Path(args.logs_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    results: list[BenchResult] = []
+    all_tasks = _build_tasks(args.samples, args.device, args.backend)
+    n = len(all_tasks)
 
     print(f"{'Sample':<40} {'Device':<6} {'1st call':>10} {'2nd call':>10} "
           f"{'Dynamo':>10} {'AOT':>10} {'Backend':>10} {'Total cmp':>10}")
     print("-" * 112)
 
-    import importlib
+    # ordered_results[idx] = (BenchResult, logs)
+    ordered_results: dict[int, tuple[BenchResult, str]] = {}
 
-    for name in args.samples:
-        module_path = SAMPLES[name]
-        mod = importlib.import_module(module_path)
+    if args.workers == 1:
+        # ── sequential ──────────────────────────────────────────────────────
+        for task in all_tasks:
+            idx, result_dict, logs = _worker(task)
+            result = BenchResult(**result_dict)
+            ordered_results[idx] = (result, logs)
+            _print_row(result)
+            (logs_dir / f"{result.sample}.log").write_text(logs, encoding="utf-8")
+    else:
+        # ── parallel ────────────────────────────────────────────────────────
+        # Use fork so workers inherit already-imported torch and module state.
+        # Results arrive out of submission order; print immediately for live
+        # progress and sort by idx before writing the CSV.
+        workers = min(args.workers, n)
+        print(f"[parallel] {n} variants across {workers} workers", flush=True)
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as exe:
+            future_to_idx = {exe.submit(_worker, task): task[0] for task in all_tasks}
+            done = 0
+            for fut in as_completed(future_to_idx):
+                try:
+                    idx, result_dict, logs = fut.result()
+                except Exception as exc:
+                    # Recover gracefully: record the error against the task
+                    idx = future_to_idx[fut]
+                    task = all_tasks[idx]
+                    result = BenchResult(sample=task[1], device=args.device, error=str(exc))
+                    logs = ""
+                    result_dict = asdict(result)
+                result = BenchResult(**result_dict)
+                ordered_results[idx] = (result, logs)
+                done += 1
+                print(f"[{done}/{n}] ", end="")
+                _print_row(result)
+                (logs_dir / f"{result.sample}.log").write_text(logs, encoding="utf-8")
 
-        # If the module exposes get_all_variants(), expand into sub-runs;
-        # otherwise fall back to the single get_model_and_input() entry point.
-        if hasattr(mod, "get_all_variants"):
-            variant_list = mod.get_all_variants()
-        else:
-            variant_list = [(name, mod.get_model_and_input)]
-
-        for variant_name, get_fn in variant_list:
-            result, logs = _run_sample(
-                name=variant_name,
-                get_model_and_input=get_fn,
-                device=args.device,
-                backend=args.backend,
-            )
-            results.append(result)
-
-            # Save per-variant TORCH_LOGS
-            (logs_dir / f"{variant_name}.log").write_text(logs, encoding="utf-8")
-
-            if result.error:
-                print(f"{variant_name:<40} ERROR: {result.error}")
-            else:
-                print(
-                    f"{variant_name:<40} {result.device:<6}"
-                    f" {result.first_call_s:>10.4f}s"
-                    f" {result.second_call_s:>10.4f}s"
-                    f" {result.dynamo_s:>10.4f}s"
-                    f" {result.aot_s:>10.4f}s"
-                    f" {result.backend_s:>10.4f}s"
-                    f" {result.total_compile_s:>10.4f}s"
-                )
-
-    # ── write CSV ──────────────────────────────────────────────────────────
+    # ── write CSV in submission order ───────────────────────────────────────
     out_path = Path(args.output)
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(BenchResult.csv_header())
-        for r in results:
-            writer.writerow(r.csv_row())
+        for idx in range(n):
+            result, _ = ordered_results[idx]
+            writer.writerow(result.csv_row())
 
     print(f"\nResults written to: {out_path.resolve()}")
     print(f"Per-sample logs  : {logs_dir.resolve()}/")
