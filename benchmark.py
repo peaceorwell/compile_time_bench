@@ -6,7 +6,7 @@ each sample model, then writes the results to compile_times.csv.
 
 Usage
 -----
-    python benchmark.py [--device cpu|cuda] [--output compile_times.csv]
+    python benchmark.py [--device cpu|mlu] [--output compile_times.csv]
 
 TORCH_LOGS
 ----------
@@ -217,16 +217,16 @@ def _run_sample(
         t0 = time.perf_counter()
         with torch.no_grad():
             compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
+        if device == "mlu":
+            torch.mlu.synchronize()
         result.first_call_s = time.perf_counter() - t0
 
         # ── second call: compiled artifact is reused ──
         t1 = time.perf_counter()
         with torch.no_grad():
             compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
+        if device == "mlu":
+            torch.mlu.synchronize()
         result.second_call_s = time.perf_counter() - t1
 
         # ── collect compile-phase timings ──
@@ -273,7 +273,7 @@ SAMPLES: dict[str, str] = {
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="torch.compile phase timing benchmark")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
+    parser.add_argument("--device", default="cpu", choices=["cpu", "mlu"],
                         help="Device to run on (default: cpu)")
     parser.add_argument("--output", default="compile_times.csv",
                         help="Output CSV path (default: compile_times.csv)")
@@ -286,8 +286,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="Which samples to run (default: all)")
     args = parser.parse_args(argv)
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("[warn] CUDA not available, falling back to CPU", file=sys.stderr)
+    if args.device == "mlu" and not torch.mlu.is_available():
+        print("[warn] MLU not available, falling back to CPU", file=sys.stderr)
         args.device = "cpu"
 
     logs_dir = Path(args.logs_dir)
