@@ -425,16 +425,20 @@ def main(argv: list[str] | None = None) -> None:
     ordered_results: dict[int, tuple[BenchResult, str]] = {}
 
     if args.workers == 1:
-        # ── sequential ──────────────────────────────────────────────────────
-        for task in all_tasks:
-            idx, result_dict, logs = _worker(task)
-            result = BenchResult(**result_dict)
+        # ── sequential: run directly in the main process, no subprocess ─────
+        import importlib
+        for idx, variant_name, module_path, fn_kwargs, device, backend in all_tasks:
+            mod = importlib.import_module(module_path)
+
+            def get_fn(device: str = device, _mod=mod, _kw=fn_kwargs):
+                return _mod.get_model_and_input(**_kw, device=device)
+
+            result, logs = _run_sample(variant_name, get_fn, device, backend)
             ordered_results[idx] = (result, logs)
             _print_row(result)
             (logs_dir / f"{result.sample}.log").write_text(logs, encoding="utf-8")
     else:
-        # ── parallel ────────────────────────────────────────────────────────
-        # Use fork so workers inherit already-imported torch and module state.
+        # ── parallel: spawn worker processes ────────────────────────────────
         # Results arrive out of submission order; print immediately for live
         # progress and sort by idx before writing the CSV.
         workers = min(args.workers, n)
