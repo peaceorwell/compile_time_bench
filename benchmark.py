@@ -402,12 +402,12 @@ def main(argv: list[str] | None = None) -> None:
                         help="torch.compile backend (default: inductor)")
     parser.add_argument("--logs-dir", default="logs",
                         help="Directory to write per-sample TORCH_LOGS (default: logs)")
-    parser.add_argument("--samples", nargs="*", default=list(SAMPLES.keys()),
+    parser.add_argument("--case_type", nargs="*", default=list(SAMPLES.keys()),
                         choices=list(SAMPLES.keys()),
-                        help="Which samples to run (default: all)")
+                        help="Which sample types to run (default: all)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel worker processes (default: 1 = sequential)")
-    parser.add_argument("--variants", nargs="+", default=None, metavar="VARIANT",
+    parser.add_argument("--case_name", nargs="+", default=None, metavar="CASE_NAME",
                         help="Run only these specific variant names, e.g. "
                              "elementwise_ni2_no1_sz256_2d_high (default: run all)")
     args = parser.parse_args(argv)
@@ -422,15 +422,15 @@ def main(argv: list[str] | None = None) -> None:
     logs_dir = Path(args.logs_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    variants_filter = set(args.variants) if args.variants else None
-    all_tasks = _build_tasks(args.samples, args.device, args.backend, variants_filter)
+    variants_filter = set(args.case_name) if args.case_name else None
+    all_tasks = _build_tasks(args.case_type, args.device, args.backend, variants_filter)
 
     if variants_filter and not all_tasks:
-        known = _build_tasks(args.samples, args.device, args.backend)
+        known = _build_tasks(args.case_type, args.device, args.backend)
         known_names = [t[1] for t in known]
         unmatched = variants_filter - {t[1] for t in known}
-        print(f"[error] No variants matched: {sorted(unmatched)}", file=sys.stderr)
-        print(f"        Available variants in selected samples ({len(known_names)}):", file=sys.stderr)
+        print(f"[error] No case_name matched: {sorted(unmatched)}", file=sys.stderr)
+        print(f"        Available case names in selected case types ({len(known_names)}):", file=sys.stderr)
         for name in known_names[:10]:
             print(f"          {name}", file=sys.stderr)
         if len(known_names) > 10:
