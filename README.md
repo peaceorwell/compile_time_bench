@@ -35,7 +35,7 @@ For each sample model the benchmark records:
 python benchmark.py
 
 # Run on CUDA
-python benchmark.py --device cuda
+python benchmark.py --device mlu
 
 # Run specific samples
 python benchmark.py --samples mlp cnn resnet
