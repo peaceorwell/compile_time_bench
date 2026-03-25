@@ -102,6 +102,29 @@ def _reset_all_caches() -> None:
         pass
 
 
+# ── warmup ───────────────────────────────────────────────────────────────────
+
+def _warmup(device: str) -> None:
+    """
+    Run one throwaway compilation to trigger all one-time initializations
+    (Inductor/Triton infrastructure JIT, pass-pipeline setup, OS page cache)
+    before any timed case starts.
+
+    Without this, the first measured case pays the full cold-start cost,
+    making single-case runs appear slower than the same case run inside a
+    full batch (where the cost is absorbed by earlier cases).
+
+    A _reset_all_caches() call after warmup ensures the timed cases still
+    start from a clean compilation state.
+    """
+    import torch.nn as nn
+    _reset_all_caches()
+    m = torch.compile(nn.Linear(4, 4).to(device))
+    with torch.no_grad():
+        m(torch.randn(4, 4, device=device))
+    _reset_all_caches()
+
+
 # ── logging setup ───────────────────────────────────────────────────────────
 _LOGFMT = "%(name)s | %(levelname)s | %(message)s"
 
@@ -424,6 +447,8 @@ def main(argv: list[str] | None = None) -> None:
 
     variants_filter = set(args.case_name) if args.case_name else None
     all_tasks = _build_tasks(args.case_type, args.device, args.backend, variants_filter)
+
+    _warmup(args.device)
 
     if variants_filter and not all_tasks:
         known = _build_tasks(args.case_type, args.device, args.backend)
