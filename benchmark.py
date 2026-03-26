@@ -302,40 +302,22 @@ def _run_sample(
             torch.mlu.synchronize()
         result.first_call_s = time.perf_counter() - t0
 
-        # ── second call: compiled artifact is reused; also measure hardware time ──
-        # cuda  – CUDA events give GPU-side elapsed time, excluding Python overhead
-        # mlu   – wall clock bracketed by torch.mlu.synchronize()
-        # cpu   – plain wall clock (no async)
+        # ── second call: compiled artifact is reused ──────────────────────
         if device == "cuda":
-            evt_s = torch.cuda.Event(enable_timing=True)
-            evt_e = torch.cuda.Event(enable_timing=True)
             torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            evt_s.record()
-            with torch.no_grad():
-                compiled(*inputs)
-            evt_e.record()
-            torch.cuda.synchronize()
-            result.second_call_s = time.perf_counter() - t1
-            result.kernel_time_ms = round(evt_s.elapsed_time(evt_e), 6)
         elif device == "mlu":
-            evt_s = torch.mlu.Event(enable_timing=True)
-            evt_e = torch.mlu.Event(enable_timing=True)
             torch.mlu.synchronize()
-            t1 = time.perf_counter()
-            evt_s.record()
-            with torch.no_grad():
-                compiled(*inputs)
-            evt_e.record()
+        t1 = time.perf_counter()
+        with torch.no_grad():
+            compiled(*inputs)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        elif device == "mlu":
             torch.mlu.synchronize()
-            result.second_call_s = time.perf_counter() - t1
-            result.kernel_time_ms = round(evt_s.elapsed_time(evt_e), 6)
-        else:
-            t1 = time.perf_counter()
-            with torch.no_grad():
-                compiled(*inputs)
-            result.second_call_s = time.perf_counter() - t1
-            result.kernel_time_ms = round(result.second_call_s * 1000.0, 6)
+        result.second_call_s = time.perf_counter() - t1
+        # kernel_time_ms is left as 0.0 here; filled in by _collect_kernel_times
+        # after the main benchmark pass so that parallel runs don't cause
+        # concurrent kernel execution that skews hardware timing.
 
         # ── collect compile-phase timings ──
         ct = _read_compile_times()
@@ -391,6 +373,80 @@ def _worker(task: tuple) -> tuple[int, dict, str]:
 
     result, logs = _run_sample(variant_name, get_fn, device, backend)
     return idx, asdict(result), logs
+
+
+# ── sequential kernel timing pass ────────────────────────────────────────────
+
+def _collect_kernel_times(
+    all_tasks: list[tuple],
+    device: str,
+    backend: str,
+) -> dict[int, float]:
+    """
+    Re-run every case sequentially in the main process and measure hardware
+    kernel execution time using device-side event clocks.
+
+    This is intentionally separate from the main benchmark pass so that
+    parallel workers (--workers > 1) do not execute kernels concurrently,
+    which would skew device-side timing.
+
+    Each case is compiled fresh (caches reset before each run) and the
+    second call (compiled artifact reused) is timed.  TORCH_LOGS output
+    is suppressed to keep the output clean.
+    """
+    import importlib
+
+    n = len(all_tasks)
+    print(f"\n[kernel timing] {n} cases (sequential) …", flush=True)
+    kernel_times: dict[int, float] = {}
+
+    for i, task in enumerate(all_tasks):
+        idx, variant_name, module_path, fn_kwargs, device_, backend_ = task
+        _reset_all_caches()
+        logging.disable(logging.CRITICAL)
+        try:
+            mod = importlib.import_module(module_path)
+            model, inputs = mod.get_model_and_input(**fn_kwargs, device=device)
+            model.eval()
+            compiled = torch.compile(model, backend=backend, fullgraph=False)
+            # first call: triggers compilation (not timed)
+            with torch.no_grad():
+                compiled(*inputs)
+            # second call: timed with device-side event clocks
+            if device == "cuda":
+                evt_s = torch.cuda.Event(enable_timing=True)
+                evt_e = torch.cuda.Event(enable_timing=True)
+                torch.cuda.synchronize()
+                evt_s.record()
+                with torch.no_grad():
+                    compiled(*inputs)
+                evt_e.record()
+                torch.cuda.synchronize()
+                kernel_times[idx] = round(evt_s.elapsed_time(evt_e), 6)
+            elif device == "mlu":
+                evt_s = torch.mlu.Event(enable_timing=True)
+                evt_e = torch.mlu.Event(enable_timing=True)
+                torch.mlu.synchronize()
+                evt_s.record()
+                with torch.no_grad():
+                    compiled(*inputs)
+                evt_e.record()
+                torch.mlu.synchronize()
+                kernel_times[idx] = round(evt_s.elapsed_time(evt_e), 6)
+            else:
+                t = time.perf_counter()
+                with torch.no_grad():
+                    compiled(*inputs)
+                kernel_times[idx] = round((time.perf_counter() - t) * 1000.0, 6)
+        except Exception:
+            kernel_times[idx] = 0.0
+        finally:
+            logging.disable(logging.NOTSET)
+
+        if (i + 1) % 50 == 0 or (i + 1) == n:
+            print(f"  [{i + 1}/{n}]", flush=True)
+
+    return kernel_times
 
 
 # ── statistics helpers ────────────────────────────────────────────────────────
@@ -623,6 +679,13 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[{done}/{n}] ", end="")
                 _print_row(result)
                 (logs_dir / f"{result.sample}.log").write_text(logs, encoding="utf-8")
+
+    # ── sequential kernel timing pass ───────────────────────────────────────
+    # Always runs in the main process (single kernel at a time) so that
+    # device-side event clocks are not disturbed by concurrent kernels.
+    kernel_times = _collect_kernel_times(all_tasks, args.device, args.backend)
+    for idx, kt in kernel_times.items():
+        ordered_results[idx][0].kernel_time_ms = kt
 
     # ── write CSV in submission order ───────────────────────────────────────
     out_path = Path(args.output)
