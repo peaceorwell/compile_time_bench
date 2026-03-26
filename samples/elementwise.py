@@ -101,8 +101,11 @@ def _build_inputs(
                                          permuted to (size, BATCH)
     n_inputs >= 2 → inputs[1] gets the special broadcast shape;
                     all other inputs use the base shape.
-                    When permute_input=True, inputs[0] has its last two
-                    dimensions swapped.
+                    When permute_input=True, inputs[0] is built with the
+                    original base shape then permuted (non-contiguous view).
+                    inputs[1] and inputs[2+] are built with the permuted
+                    shapes directly so they remain broadcastable against the
+                    permuted inputs[0].
     """
     if n_inputs == 1:
         if permute_input:
@@ -117,11 +120,22 @@ def _build_inputs(
     base = _base_shape(n_dims, size)
     special = special_fn(size) if special_fn is not None else base
 
-    shapes = [base] * n_inputs
-    shapes[1] = special
-    tensors = [torch.randn(s, device=device) for s in shapes]
-    if permute_input:
-        tensors[0] = _permute_last2(tensors[0])
+    if not permute_input:
+        shapes = [base] * n_inputs
+        shapes[1] = special
+        return tuple(torch.randn(s, device=device) for s in shapes)
+
+    # permute_input=True:
+    #   inputs[0]  – built with original base shape, then permuted (non-contiguous)
+    #   inputs[1]  – built with the permuted special shape (still broadcastable)
+    #   inputs[2+] – built with the permuted base shape
+    base_perm    = base[:-2]    + (base[-1],    base[-2])
+    special_perm = special[:-2] + (special[-1], special[-2])
+
+    tensors: list[torch.Tensor] = [_permute_last2(torch.randn(base, device=device))]
+    tensors.append(torch.randn(special_perm, device=device))
+    for _ in range(2, n_inputs):
+        tensors.append(torch.randn(base_perm, device=device))
     return tuple(tensors)
 
 
