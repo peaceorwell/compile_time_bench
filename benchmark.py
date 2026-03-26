@@ -402,7 +402,6 @@ def _collect_kernel_times(
 
     for i, task in enumerate(all_tasks):
         idx, variant_name, module_path, fn_kwargs, device_, backend_ = task
-        _reset_all_caches()
         logging.disable(logging.CRITICAL)
         try:
             mod = importlib.import_module(module_path)
