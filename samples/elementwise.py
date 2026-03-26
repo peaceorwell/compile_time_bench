@@ -1,5 +1,5 @@
 """
-Parametric elementwise-ops sample with broadcast dimension.
+Parametric elementwise-ops sample with broadcast and permute dimensions.
 
 Combination grid
 ----------------
@@ -23,13 +23,21 @@ bcast_mode (n_inputs == 1 → no broadcast, unchanged):
     3d_low      – inputs[1] = (OUTER, BATCH, 1   )   broadcast along size
     3d_hl       – inputs[1] = (1,     BATCH, 1   )   broadcast along outer+size
 
+permute_input (applied to inputs[0]):
+  False – inputs[0] is contiguous, shape unchanged
+  True  – inputs[0] has its last two dimensions swapped (non-contiguous view)
+          n_inputs=1: tensor is built as 2-D (BATCH, size) then permuted to
+                      (size, BATCH) so that permute is meaningful
+          n_inputs>=2, 2-D base: (BATCH, size) → permuted to (size, BATCH)
+          n_inputs>=2, 3-D base: (OUTER, BATCH, size) → permuted to (OUTER, size, BATCH)
+
 Fixed spatial dims: BATCH = 4, OUTER = 2.
 
 Total variants
 --------------
-  n_inputs=1                  :  1 mode  × 4 sizes × 4 n_outputs =  16
-  n_inputs ∈ {2, 3, 4} each  :  7 modes × 4 sizes × 4 n_outputs = 112
-  Grand total                 : 16 + 3 × 112 = 352
+  Per non-permute variant: 352 (same as before)
+  Per permute variant    : 352
+  Grand total            : 704
 """
 from __future__ import annotations
 
@@ -70,20 +78,36 @@ def _base_shape(n_dims: int, size: int) -> tuple[int, ...]:
     return (_OUTER, _BATCH, size)
 
 
+def _permute_last2(t: torch.Tensor) -> torch.Tensor:
+    """Swap the last two dimensions of a tensor (must be >= 2-D)."""
+    ndim = t.dim()
+    perm = list(range(ndim))
+    perm[-2], perm[-1] = perm[-1], perm[-2]
+    return t.permute(*perm)
+
+
 def _build_inputs(
     n_inputs: int,
     size: int,
     bcast_mode: str,
     device: str,
+    permute_input: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """
     Build the input tensor tuple for a given broadcast mode.
 
-    n_inputs == 1 → always a 1-D tensor (mode is ignored).
+    n_inputs == 1, permute_input=False → 1-D tensor (size,)
+    n_inputs == 1, permute_input=True  → 2-D tensor (BATCH, size), then
+                                         permuted to (size, BATCH)
     n_inputs >= 2 → inputs[1] gets the special broadcast shape;
                     all other inputs use the base shape.
+                    When permute_input=True, inputs[0] has its last two
+                    dimensions swapped.
     """
     if n_inputs == 1:
+        if permute_input:
+            t = torch.randn(_BATCH, size, device=device)
+            return (_permute_last2(t),)
         return (torch.randn(size, device=device),)
 
     # Look up mode descriptor
@@ -95,7 +119,10 @@ def _build_inputs(
 
     shapes = [base] * n_inputs
     shapes[1] = special
-    return tuple(torch.randn(s, device=device) for s in shapes)
+    tensors = [torch.randn(s, device=device) for s in shapes]
+    if permute_input:
+        tensors[0] = _permute_last2(tensors[0])
+    return tuple(tensors)
 
 
 # ── model ─────────────────────────────────────────────────────────────────────
@@ -144,36 +171,47 @@ def get_model_and_input(
     n_outputs: int = 1,
     size: int = 256,
     bcast_mode: str = "no_bcast",
+    permute_input: bool = False,
     device: str = "cpu",
 ) -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     model = ElementwiseOps(n_inputs, n_outputs).to(device)
-    inputs = _build_inputs(n_inputs, size, bcast_mode, device)
+    inputs = _build_inputs(n_inputs, size, bcast_mode, device, permute_input)
     return model, inputs
 
 
 def get_variant_specs() -> list[tuple[str, dict]]:
     """
     Return (variant_name, fn_kwargs) pairs for every combination of
-    n_inputs × n_outputs × size × bcast_mode.
+    n_inputs × n_outputs × size × bcast_mode × permute_input.
 
     fn_kwargs are plain picklable dicts passed directly to
     get_model_and_input(), suitable for both sequential and parallel
     execution via multiprocessing.
 
-    n_inputs == 1 produces no bcast_mode suffix (1-D tensor, unchanged).
-    n_inputs >= 2 produces one variant per bcast_mode in _BCAST_MODES.
+    n_inputs == 1 produces no bcast_mode suffix (mode is irrelevant for 1-D).
+    permute_input=True variants are suffixed with '_perm'.
+
+    Total: 352 (no-permute) + 352 (permute) = 704 variants.
     """
     specs: list[tuple[str, dict]] = []
     for ni, no, sz in itertools.product(N_INPUTS_CHOICES, N_OUTPUTS_CHOICES, SIZE_CHOICES):
         if ni == 1:
-            specs.append((
-                f"elementwise_ni{ni}_no{no}_sz{sz}",
-                {"n_inputs": ni, "n_outputs": no, "size": sz, "bcast_mode": "no_bcast"},
-            ))
+            modes = [("", "no_bcast")]
         else:
-            for mode_name, _, _ in _BCAST_MODES:
+            modes = [(f"_{mode_name}", mode_name) for mode_name, _, _ in _BCAST_MODES]
+
+        for mode_suffix, mode_name in modes:
+            base_name = f"elementwise_ni{ni}_no{no}_sz{sz}{mode_suffix}"
+            for permute in (False, True):
+                perm_suffix = "_perm" if permute else ""
                 specs.append((
-                    f"elementwise_ni{ni}_no{no}_sz{sz}_{mode_name}",
-                    {"n_inputs": ni, "n_outputs": no, "size": sz, "bcast_mode": mode_name},
+                    f"{base_name}{perm_suffix}",
+                    {
+                        "n_inputs": ni,
+                        "n_outputs": no,
+                        "size": sz,
+                        "bcast_mode": mode_name,
+                        "permute_input": permute,
+                    },
                 ))
     return specs
