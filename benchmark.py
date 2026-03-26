@@ -351,6 +351,43 @@ def _run_sample(
 
 # ── subprocess worker (module-level so it is picklable) ──────────────────────
 
+def _pin_worker_to_cores(slot: int, n_workers: int) -> None:
+    """
+    Pin the current process to a dedicated subset of available CPU cores.
+
+    Divides the set of CPUs visible to this process evenly among workers.
+    Each worker slot gets an exclusive slice so that workers do not share
+    physical cores, which reduces scheduler preemption and L1/L2 cache
+    thrashing during compilation.
+
+    No-op on systems without sched_setaffinity (macOS, Windows, sandboxed
+    environments) — falls back silently.
+    """
+    try:
+        available = sorted(os.sched_getaffinity(0))
+        if len(available) <= 1:
+            return
+        cores_per_worker = max(1, len(available) // n_workers)
+        start = (slot % n_workers) * cores_per_worker
+        assigned = set(available[start: start + cores_per_worker])
+        os.sched_setaffinity(0, assigned)
+    except (AttributeError, OSError):
+        pass
+
+
+def _worker_init(slot_counter: object, n_workers: int) -> None:
+    """
+    ProcessPoolExecutor initializer — runs once in each worker process.
+
+    Atomically claims the next available slot from the shared counter and
+    pins the process to the corresponding CPU core slice.
+    """
+    with slot_counter.get_lock():  # type: ignore[attr-defined]
+        slot = slot_counter.value
+        slot_counter.value += 1
+    _pin_worker_to_cores(slot, n_workers)
+
+
 def _worker(task: tuple) -> tuple[int, dict, str]:
     """
     Entry point for each ProcessPoolExecutor worker.
@@ -659,7 +696,13 @@ def main(argv: list[str] | None = None) -> None:
         workers = min(args.workers, n)
         print(f"[parallel] {n} variants across {workers} workers", flush=True)
         ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as exe:
+        slot_counter = ctx.Value("i", 0)
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_worker_init,
+            initargs=(slot_counter, workers),
+        ) as exe:
             future_to_idx = {exe.submit(_worker, task): task[0] for task in all_tasks}
             done = 0
             for fut in as_completed(future_to_idx):
