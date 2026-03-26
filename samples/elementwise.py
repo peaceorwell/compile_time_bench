@@ -1,11 +1,12 @@
 """
-Parametric elementwise-ops sample with broadcast and permute dimensions.
+Parametric elementwise-ops sample.
 
 Combination grid
 ----------------
 n_inputs  ∈ {1, 2, 3, 4}
 n_outputs ∈ {1, 2, 3, 4}
 size      ∈ {16, 256, 8192, 32768}   – last-dimension width
+dtype     ∈ {fp32, fp16}
 bcast_mode (n_inputs == 1 → no broadcast, unchanged):
 
   For n_inputs >= 2, one of the inputs (index 1) is given a shape that
@@ -31,13 +32,19 @@ permute_input (applied to inputs[0]):
           n_inputs>=2, 2-D base: (BATCH, size) → permuted to (size, BATCH)
           n_inputs>=2, 3-D base: (OUTER, BATCH, size) → permuted to (OUTER, size, BATCH)
 
+Compute pattern
+---------------
+The forward pass is arithmetic-heavy (+, -, *, /) with a single relu at
+the end for variety.  Activation-heavy ops (sigmoid, tanh, exp, log) are
+intentionally kept out of the hot path.
+
 Fixed spatial dims: BATCH = 4, OUTER = 2.
 
 Total variants
 --------------
-  Per non-permute variant: 352 (same as before)
-  Per permute variant    : 352
-  Grand total            : 704
+  n_inputs=1             :  1 mode  × 4 sizes × 4 n_outputs × 2 permute × 2 dtype =   64
+  n_inputs ∈ {2,3,4} ea :  7 modes × 4 sizes × 4 n_outputs × 2 permute × 2 dtype =  448
+  Grand total            : 64 + 3 × 448 = 1408
 """
 from __future__ import annotations
 
@@ -51,6 +58,9 @@ import torch.nn as nn
 N_INPUTS_CHOICES  = [1, 2, 3, 4]
 N_OUTPUTS_CHOICES = [1, 2, 3, 4]
 SIZE_CHOICES      = [16, 256, 8192, 32768]
+DTYPE_CHOICES     = ["fp32", "fp16"]
+
+_TORCH_DTYPE = {"fp32": torch.float32, "fp16": torch.float16}
 
 _BATCH = 4   # batch / middle dimension
 _OUTER = 2   # outer dimension (3-D only)
@@ -92,6 +102,7 @@ def _build_inputs(
     bcast_mode: str,
     device: str,
     permute_input: bool = False,
+    dtype: str = "fp32",
 ) -> tuple[torch.Tensor, ...]:
     """
     Build the input tensor tuple for a given broadcast mode.
@@ -107,11 +118,13 @@ def _build_inputs(
                     shapes directly so they remain broadcastable against the
                     permuted inputs[0].
     """
+    td = _TORCH_DTYPE[dtype]
+
     if n_inputs == 1:
         if permute_input:
-            t = torch.randn(_BATCH, size, device=device)
+            t = torch.randn(_BATCH, size, device=device, dtype=td)
             return (_permute_last2(t),)
-        return (torch.randn(size, device=device),)
+        return (torch.randn(size, device=device, dtype=td),)
 
     # Look up mode descriptor
     mode_entry = next(e for e in _BCAST_MODES if e[0] == bcast_mode)
@@ -123,7 +136,7 @@ def _build_inputs(
     if not permute_input:
         shapes = [base] * n_inputs
         shapes[1] = special
-        return tuple(torch.randn(s, device=device) for s in shapes)
+        return tuple(torch.randn(s, device=device, dtype=td) for s in shapes)
 
     # permute_input=True:
     #   inputs[0]  – built with original base shape, then permuted (non-contiguous)
@@ -132,10 +145,10 @@ def _build_inputs(
     base_perm    = base[:-2]    + (base[-1],    base[-2])
     special_perm = special[:-2] + (special[-1], special[-2])
 
-    tensors: list[torch.Tensor] = [_permute_last2(torch.randn(base, device=device))]
-    tensors.append(torch.randn(special_perm, device=device))
+    tensors: list[torch.Tensor] = [_permute_last2(torch.randn(base, device=device, dtype=td))]
+    tensors.append(torch.randn(special_perm, device=device, dtype=td))
     for _ in range(2, n_inputs):
-        tensors.append(torch.randn(base_perm, device=device))
+        tensors.append(torch.randn(base_perm, device=device, dtype=td))
     return tuple(tensors)
 
 
@@ -158,20 +171,20 @@ class ElementwiseOps(nn.Module):
         self.n_outputs = n_outputs
 
     def forward(self, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...] | torch.Tensor:
-        # ── combine all inputs into one intermediate tensor ──────────────────
+        # ── combine all inputs via arithmetic (+, -, *, /) ───────────────────
         mid = inputs[0]
         if self.n_inputs >= 2:
-            mid = torch.sigmoid(mid) * torch.tanh(inputs[1])
+            mid = mid * inputs[1] + (inputs[0] - inputs[1])
         if self.n_inputs >= 3:
-            mid = mid + torch.relu(inputs[2] - 0.5)
+            mid = mid / (inputs[2].abs() + 1e-6) - inputs[2] * 0.5
         if self.n_inputs >= 4:
-            mid = mid * torch.exp(-inputs[3].abs())
+            mid = (mid + inputs[3]) * (mid - inputs[3] * 0.25)
 
-        # ── derive n_outputs from the intermediate ───────────────────────────
-        out0 = torch.sqrt(mid.abs() + 1e-6)
-        out1 = torch.log1p(mid.abs())
-        out2 = torch.tanh(mid) * 2.0
-        out3 = mid / (mid.abs().amax() + 1e-8)
+        # ── derive n_outputs (arithmetic-heavy; one relu for variety) ────────
+        out0 = mid * 2.0 - 1.0
+        out1 = (mid + 1.0) / (mid.abs() + 1.0)
+        out2 = mid * mid - mid * 0.5 + 0.25
+        out3 = torch.relu(mid * 0.5 + 0.1)
 
         all_outputs = (out0, out1, out2, out3)
         result = all_outputs[: self.n_outputs]
@@ -186,17 +199,19 @@ def get_model_and_input(
     size: int = 256,
     bcast_mode: str = "no_bcast",
     permute_input: bool = False,
+    dtype: str = "fp32",
     device: str = "cpu",
 ) -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
-    model = ElementwiseOps(n_inputs, n_outputs).to(device)
-    inputs = _build_inputs(n_inputs, size, bcast_mode, device, permute_input)
+    td = _TORCH_DTYPE[dtype]
+    model = ElementwiseOps(n_inputs, n_outputs).to(device=device, dtype=td)
+    inputs = _build_inputs(n_inputs, size, bcast_mode, device, permute_input, dtype)
     return model, inputs
 
 
 def get_variant_specs() -> list[tuple[str, dict]]:
     """
     Return (variant_name, fn_kwargs) pairs for every combination of
-    n_inputs × n_outputs × size × bcast_mode × permute_input.
+    n_inputs × n_outputs × size × bcast_mode × permute_input × dtype.
 
     fn_kwargs are plain picklable dicts passed directly to
     get_model_and_input(), suitable for both sequential and parallel
@@ -204,8 +219,9 @@ def get_variant_specs() -> list[tuple[str, dict]]:
 
     n_inputs == 1 produces no bcast_mode suffix (mode is irrelevant for 1-D).
     permute_input=True variants are suffixed with '_perm'.
+    dtype is suffixed as '_fp32' or '_fp16'.
 
-    Total: 352 (no-permute) + 352 (permute) = 704 variants.
+    Total: 704 (fp32) + 704 (fp16) = 1408 variants.
     """
     specs: list[tuple[str, dict]] = []
     for ni, no, sz in itertools.product(N_INPUTS_CHOICES, N_OUTPUTS_CHOICES, SIZE_CHOICES):
@@ -218,14 +234,16 @@ def get_variant_specs() -> list[tuple[str, dict]]:
             base_name = f"elementwise_ni{ni}_no{no}_sz{sz}{mode_suffix}"
             for permute in (False, True):
                 perm_suffix = "_perm" if permute else ""
-                specs.append((
-                    f"{base_name}{perm_suffix}",
-                    {
-                        "n_inputs": ni,
-                        "n_outputs": no,
-                        "size": sz,
-                        "bcast_mode": mode_name,
-                        "permute_input": permute,
-                    },
-                ))
+                for dtype in DTYPE_CHOICES:
+                    specs.append((
+                        f"{base_name}{perm_suffix}_{dtype}",
+                        {
+                            "n_inputs": ni,
+                            "n_outputs": no,
+                            "size": sz,
+                            "bcast_mode": mode_name,
+                            "permute_input": permute,
+                            "dtype": dtype,
+                        },
+                    ))
     return specs
