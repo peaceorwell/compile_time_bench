@@ -171,20 +171,33 @@ class ElementwiseOps(nn.Module):
         self.n_outputs = n_outputs
 
     def forward(self, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...] | torch.Tensor:
-        # ── combine all inputs via arithmetic (+, -, *, /) ───────────────────
-        mid = inputs[0]
-        if self.n_inputs >= 2:
-            mid = mid * inputs[1] + (inputs[0] - inputs[1])
+        # ── combine inputs ────────────────────────────────────────────────────
+        # Activation budget for the input phase:
+        #   n_inputs=1 → 1 act (tanh)
+        #   n_inputs=2 → 1 act (sigmoid)
+        #   n_inputs=3 → 2 acts (sigmoid + tanh)
+        #   n_inputs=4 → 2 acts (sigmoid + tanh; 4th input uses arithmetic only)
+        if self.n_inputs == 1:
+            mid = torch.tanh(inputs[0])                                   # act 1
+        else:
+            mid = torch.sigmoid(inputs[0]) * inputs[1] \
+                  + (inputs[0] - inputs[1])                               # act 1
         if self.n_inputs >= 3:
-            mid = mid / (inputs[2].abs() + 1e-6) - inputs[2] * 0.5
+            mid = mid + torch.tanh(inputs[2]) - inputs[2] * 0.5          # act 2
         if self.n_inputs >= 4:
-            mid = (mid + inputs[3]) * (mid - inputs[3] * 0.25)
+            mid = (mid + inputs[3]) * (mid - inputs[3] * 0.25)           # arithmetic
 
-        # ── derive n_outputs (arithmetic-heavy; one relu for variety) ────────
+        # ── derive outputs ────────────────────────────────────────────────────
+        # Activation budget for the output phase:
+        #   n_outputs=1 → 0 acts
+        #   n_outputs=2 → 1 act  (relu on out1)
+        #   n_outputs=3 → 1 act  (relu on out1; out2 arithmetic)
+        #   n_outputs=4 → 2 acts (relu on out1; sqrt on out3)
+        # Combined total ≤ 4 across all (n_inputs, n_outputs) combinations.
         out0 = mid * 2.0 - 1.0
-        out1 = (mid + 1.0) / (mid.abs() + 1.0)
-        out2 = mid * mid - mid * 0.5 + 0.25
-        out3 = torch.relu(mid * 0.5 + 0.1)
+        out1 = torch.relu(mid) + mid * 0.5                               # act
+        out2 = mid * mid / (mid.abs() + 1.0)
+        out3 = torch.sqrt(mid.abs() + 1e-6) * (mid + 1.0)               # act
 
         all_outputs = (out0, out1, out2, out3)
         result = all_outputs[: self.n_outputs]
