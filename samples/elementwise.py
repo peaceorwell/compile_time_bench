@@ -34,9 +34,13 @@ permute_input (applied to inputs[0]):
 
 Compute pattern
 ---------------
-The forward pass is arithmetic-heavy (+, -, *, /) with a single relu at
-the end for variety.  Activation-heavy ops (sigmoid, tanh, exp, log) are
-intentionally kept out of the hot path.
+The forward pass mixes arithmetic (+, -, *, /) and activation ops
+(sigmoid, tanh, relu, sqrt).  The number of activations scales with
+max(n_inputs, n_outputs) and is capped at 4 per case:
+
+  Input phase:   n_inputs=1 → tanh; n_inputs=2 → sigmoid;
+                 n_inputs=3 → sigmoid + tanh; n_inputs=4 → same (4th is arithmetic)
+  Output phase:  n_outputs≥2 → relu on out1; n_outputs≥4 → sqrt on out3
 
 Fixed spatial dims: BATCH = 4, OUTER = 2.
 
