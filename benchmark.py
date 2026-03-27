@@ -670,7 +670,7 @@ def _build_tasks(
     for name in sample_names:
         module_path = SAMPLES[name]
         mod = importlib.import_module(module_path)
-        compute_accuracy = bool(getattr(mod, "COMPUTE_ACCURACY", False))
+        compute_accuracy = bool(getattr(mod, "COMPUTE_ACCURACY", True))
         if hasattr(mod, "get_variant_specs"):
             specs = mod.get_variant_specs()
         else:
