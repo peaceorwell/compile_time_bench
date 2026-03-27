@@ -257,6 +257,12 @@ class BenchResult:
     #   mlu  – torch.mlu.Event.elapsed_time()  (device-side clock, ms)
     #   cpu  – wall clock converted to ms
     kernel_time_ms: float = 0.0
+    # ── accuracy: compiled vs eager (0.0 when not computed) ─────────────────
+    # Outputs are cast to fp32 before comparison to avoid fp16 overflow.
+    max_abs_err:  float = 0.0   # max element-wise absolute error
+    mean_abs_err: float = 0.0   # mean element-wise absolute error
+    max_rel_err:  float = 0.0   # max element-wise relative error
+    cosine_sim:   float = 0.0   # cosine similarity (1.0 = identical)
     # error message if compilation failed
     error: str = ""
 
@@ -268,6 +274,45 @@ class BenchResult:
         return [getattr(self, f.name) for f in fields(self)]
 
 
+# ── accuracy helpers ─────────────────────────────────────────────────────────
+
+def _compute_accuracy(
+    eager_out: torch.Tensor | tuple,
+    compiled_out: torch.Tensor | tuple,
+) -> tuple[float, float, float, float]:
+    """
+    Compare compiled output against eager reference.
+
+    Tensors are cast to fp32 before comparison so that fp16 magnitude
+    differences don't confuse the relative-error denominator.
+
+    Returns (max_abs_err, mean_abs_err, max_rel_err, cosine_sim).
+    """
+    def _to_flat_fp32(out):
+        if isinstance(out, (tuple, list)):
+            return torch.cat([t.detach().float().flatten() for t in out])
+        return out.detach().float().flatten()
+
+    ref = _to_flat_fp32(eager_out)
+    cmp = _to_flat_fp32(compiled_out)
+
+    abs_err = (ref - cmp).abs()
+    max_abs  = abs_err.max().item()
+    mean_abs = abs_err.mean().item()
+
+    rel_err  = (abs_err / ref.abs().clamp(min=1e-8)).max().item()
+    cos_sim  = torch.nn.functional.cosine_similarity(
+        ref.unsqueeze(0), cmp.unsqueeze(0)
+    ).item()
+
+    return (
+        round(max_abs,  8),
+        round(mean_abs, 8),
+        round(rel_err,  8),
+        round(cos_sim,  8),
+    )
+
+
 # ── per-sample benchmark ─────────────────────────────────────────────────────
 
 def _run_sample(
@@ -275,6 +320,7 @@ def _run_sample(
     get_model_and_input: Callable,
     device: str,
     backend: str = "inductor",
+    compute_accuracy: bool = False,
 ) -> tuple[BenchResult, str]:
     """Compile and run one sample; return (BenchResult, captured_logs)."""
     result = BenchResult(sample=name, device=device)
@@ -332,6 +378,16 @@ def _run_sample(
         result.post_grad_passes_s = ct["post_grad_passes_s"]
         result.joint_graph_passes_s = ct["joint_graph_passes_s"]
         result.cache_hit = ct["cache_hit"]
+
+        # ── accuracy: compiled vs eager ──────────────────────────────────────
+        if compute_accuracy:
+            with torch.no_grad():
+                eager_out    = model(*inputs)
+                compiled_out = compiled(*inputs)
+            (result.max_abs_err,
+             result.mean_abs_err,
+             result.max_rel_err,
+             result.cosine_sim) = _compute_accuracy(eager_out, compiled_out)
 
         # ── frame / graph-break counters ──
         metrics = getattr(_dynamo_utils, "compilation_time_metrics", {})
@@ -400,7 +456,7 @@ def _worker(task: tuple) -> tuple[int, dict, str]:
     to _run_sample.  Returns (idx, result_as_dict, captured_logs) so the
     main process can reconstruct a BenchResult and maintain submission order.
     """
-    idx, variant_name, module_path, fn_kwargs, device, backend = task
+    idx, variant_name, module_path, fn_kwargs, device, backend, compute_accuracy = task
 
     import importlib
     mod = importlib.import_module(module_path)
@@ -408,7 +464,7 @@ def _worker(task: tuple) -> tuple[int, dict, str]:
     def get_fn(device: str = "cpu"):
         return mod.get_model_and_input(**fn_kwargs, device=device)
 
-    result, logs = _run_sample(variant_name, get_fn, device, backend)
+    result, logs = _run_sample(variant_name, get_fn, device, backend, compute_accuracy)
     return idx, asdict(result), logs
 
 
@@ -438,7 +494,7 @@ def _collect_kernel_times(
     kernel_times: dict[int, float] = {}
 
     for i, task in enumerate(all_tasks):
-        idx, variant_name, module_path, fn_kwargs, device_, backend_ = task
+        idx, variant_name, module_path, fn_kwargs, device_, backend_, _ = task
         logging.disable(logging.CRITICAL)
         try:
             mod = importlib.import_module(module_path)
@@ -570,6 +626,7 @@ SAMPLES: dict[str, str] = {
     "resnet": "samples.resnet",
     "lstm": "samples.lstm",
     "elementwise": "samples.elementwise",
+    "gemm": "samples.gemm",
 }
 
 
@@ -598,10 +655,12 @@ def _build_tasks(
     Build the flat task list from all requested samples.
 
     Each task is a picklable tuple:
-        (idx, variant_name, module_path, fn_kwargs, device, backend)
+        (idx, variant_name, module_path, fn_kwargs, device, backend, compute_accuracy)
 
     Modules that expose get_variant_specs() are expanded into one task per
     variant.  All others produce a single task with fn_kwargs={}.
+
+    compute_accuracy is True when the module sets COMPUTE_ACCURACY = True.
 
     If variants_filter is given, only variants whose name is in the set
     are included.
@@ -611,13 +670,17 @@ def _build_tasks(
     for name in sample_names:
         module_path = SAMPLES[name]
         mod = importlib.import_module(module_path)
+        compute_accuracy = bool(getattr(mod, "COMPUTE_ACCURACY", False))
         if hasattr(mod, "get_variant_specs"):
             specs = mod.get_variant_specs()
         else:
             specs = [(name, {})]
         for variant_name, fn_kwargs in specs:
             if variants_filter is None or variant_name in variants_filter:
-                tasks.append((len(tasks), variant_name, module_path, fn_kwargs, device, backend))
+                tasks.append((
+                    len(tasks), variant_name, module_path,
+                    fn_kwargs, device, backend, compute_accuracy,
+                ))
     return tasks
 
 
@@ -679,13 +742,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.workers == 1:
         # ── sequential: run directly in the main process, no subprocess ─────
         import importlib
-        for idx, variant_name, module_path, fn_kwargs, device, backend in all_tasks:
+        for idx, variant_name, module_path, fn_kwargs, device, backend, compute_accuracy in all_tasks:
             mod = importlib.import_module(module_path)
 
             def get_fn(device: str = device, _mod=mod, _kw=fn_kwargs):
                 return _mod.get_model_and_input(**_kw, device=device)
 
-            result, logs = _run_sample(variant_name, get_fn, device, backend)
+            result, logs = _run_sample(variant_name, get_fn, device, backend, compute_accuracy)
             ordered_results[idx] = (result, logs)
             _print_row(result)
             (logs_dir / f"{result.sample}.log").write_text(logs, encoding="utf-8")
