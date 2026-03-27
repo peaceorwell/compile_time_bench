@@ -10,13 +10,8 @@ execution time and numerical accuracy (compiled vs. eager).
 ```
 benchmark.py          – main entry point
 samples/
-  mlp.py              – 4-layer MLP
-  cnn.py              – 3-block CNN
-  transformer.py      – 4-layer Transformer encoder
-  resnet.py           – ResNet-like (3 residual stages)
-  lstm.py             – 2-layer LSTM classifier
   elementwise.py      – parametric elementwise fusion stress test (1 408 variants)
-  gemm.py             – matmul / batch_matmul sweep (512 variants)
+  gemm.py             – matmul / batch_matmul dimension sweep (512 variants)
 logs/                 – per-case TORCH_LOGS output (written at runtime)
 results/              – suggested directory for output CSV files
 ```
@@ -64,11 +59,6 @@ Outputs are cast to fp32 before comparison to avoid fp16 overflow artefacts.
 
 | `--case_type` | Description | Variants |
 |---|---|---|
-| `mlp` | 4-layer MLP (784→512→256→128→10) | 1 |
-| `cnn` | 3-block CNN with BatchNorm + MaxPool | 1 |
-| `transformer` | 4-layer Transformer encoder with multi-head attention | 1 |
-| `resnet` | ResNet-like with 3 stages of residual blocks | 1 |
-| `lstm` | 2-layer LSTM classifier | 1 |
 | `elementwise` | Parametric elementwise fusion: arithmetic + activations | 1 408 |
 | `gemm` | `matmul` and `batch_matmul` dimension sweep | 512 |
 

@@ -620,11 +620,6 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 SAMPLES: dict[str, str] = {
-    "mlp": "samples.mlp",
-    "cnn": "samples.cnn",
-    "transformer": "samples.transformer",
-    "resnet": "samples.resnet",
-    "lstm": "samples.lstm",
     "elementwise": "samples.elementwise",
     "gemm": "samples.gemm",
 }
