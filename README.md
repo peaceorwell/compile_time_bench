@@ -1,9 +1,9 @@
 # compile_time_bench
 
 Benchmarks `torch.compile()` compilation phase timings across a variety of
-model architectures.  Uses `TORCH_LOGS` and `torch._dynamo` internal metrics
-to capture detailed per-phase timing, and optionally measures hardware kernel
-execution time and numerical accuracy (compiled vs. eager).
+model patterns.  Uses `TORCH_LOGS` and `torch._dynamo` internal metrics
+to capture detailed per-phase timing, measures hardware kernel execution
+time, and compares compiled vs. eager numerical accuracy for every case.
 
 ## Project layout
 
@@ -118,8 +118,7 @@ python benchmark.py
 python benchmark.py --device cuda
 python benchmark.py --device mlu
 
-# Run specific case types
-python benchmark.py --case_type mlp cnn resnet
+# Run a specific case type
 python benchmark.py --case_type gemm
 python benchmark.py --case_type elementwise
 
