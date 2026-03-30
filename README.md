@@ -128,12 +128,8 @@ table to stdout.
 ## Usage
 
 ```bash
-# Run all case types on CPU (default)
+# Run all cases (device auto-detected: MLU > CUDA > CPU)
 python benchmark.py
-
-# Run on CUDA or MLU (Cambricon)
-python benchmark.py --device cuda
-python benchmark.py --device mlu
 
 # Run a specific case type
 python benchmark.py --case_type gemm
@@ -152,6 +148,9 @@ python benchmark.py --workers 4
 
 # Custom output path
 python benchmark.py --output results/my_run.csv
+
+# Override device explicitly
+python benchmark.py --device cpu
 
 # Change backend (default: inductor)
 python benchmark.py --backend aot_eager
