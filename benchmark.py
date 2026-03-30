@@ -6,7 +6,8 @@ each sample model, then writes the results to compile_times.csv.
 
 Usage
 -----
-    python benchmark.py [--device cpu|cuda|mlu] [--output compile_times.csv]
+    python benchmark.py [--output compile_times.csv]   # device auto-detected
+    python benchmark.py --device cpu                   # override device
 
 TORCH_LOGS
 ----------
@@ -100,6 +101,24 @@ def _reset_all_caches() -> None:
             _cc.AOTAutogradCache._cache.clear()
     except Exception:
         pass
+
+
+# ── device detection ─────────────────────────────────────────────────────────
+
+def _detect_device() -> str:
+    """
+    Return the best available compute device.
+
+    Priority: MLU > CUDA > CPU.
+    """
+    try:
+        if torch.mlu.is_available():
+            return "mlu"
+    except AttributeError:
+        pass
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 # ── warmup ───────────────────────────────────────────────────────────────────
@@ -771,8 +790,8 @@ def _build_tasks(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="torch.compile phase timing benchmark")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mlu"],
-                        help="Device to run on (default: cpu)")
+    parser.add_argument("--device", default=None, choices=["cpu", "cuda", "mlu"],
+                        help="Device to run on (default: auto-detect — MLU > CUDA > CPU)")
     parser.add_argument("--output", default="compile_times.csv",
                         help="Output CSV path (default: compile_times.csv)")
     parser.add_argument("--backend", default="inductor",
@@ -789,12 +808,20 @@ def main(argv: list[str] | None = None) -> None:
                              "elementwise_ni2_no1_sz256_2d_high (default: run all)")
     args = parser.parse_args(argv)
 
-    if args.device == "cuda" and not torch.cuda.is_available():
+    if args.device is None:
+        args.device = _detect_device()
+        print(f"[device] auto-detected: {args.device}", flush=True)
+    elif args.device == "cuda" and not torch.cuda.is_available():
         print("[warn] CUDA not available, falling back to CPU", file=sys.stderr)
         args.device = "cpu"
-    elif args.device == "mlu" and not torch.mlu.is_available():
-        print("[warn] MLU not available, falling back to CPU", file=sys.stderr)
-        args.device = "cpu"
+    elif args.device == "mlu":
+        try:
+            available = torch.mlu.is_available()
+        except AttributeError:
+            available = False
+        if not available:
+            print("[warn] MLU not available, falling back to CPU", file=sys.stderr)
+            args.device = "cpu"
 
     logs_dir = Path(args.logs_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
