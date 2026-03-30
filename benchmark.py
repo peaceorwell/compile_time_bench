@@ -687,7 +687,7 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
     # ── build grouped summary table ───────────────────────────────────────────
     col_w = 16
     label_w = 32
-    total_w = label_w + col_w * 3 + 6
+    total_w = label_w + col_w * 3 + 9
     buf = io.StringIO()
 
     def _emit(line: str = "") -> None:
