@@ -113,7 +113,7 @@ dtype   ∈ {fp32, fp16}
 | 次数 | 用途 |
 |---|---|
 | 第 5 次 | 利用第一阶段的磁盘缓存重新编译（速度很快） |
-| 第 6 次 | 用 `torch.{cuda,mlu}.Event.elapsed_time()` 计时 — 记录 `kernel_time_ms` |
+| 第 6 次 | 用 `torch.cuda.Event.elapsed_time()` 计时 — 记录 `kernel_time_ms` |
 
 第二阶段强制串行，确保每次只有一个 kernel 在设备上执行，保证硬件计时的准确性。
 CPU 设备使用 wall-clock 计时。
@@ -126,7 +126,7 @@ CPU 设备使用 wall-clock 计时。
 ## 使用方法
 
 ```bash
-# 运行所有 case（自动检测设备：MLU > CUDA > CPU）
+# 运行所有 case（自动检测设备：优先 CUDA，否则 CPU）
 python benchmark.py
 
 # 运行指定类别
