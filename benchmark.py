@@ -257,6 +257,8 @@ class BenchResult:
     #   mlu  – torch.mlu.Event.elapsed_time()  (device-side clock, ms)
     #   cpu  – wall clock converted to ms
     kernel_time_ms: float = 0.0
+    # hardware execution time of the same op in eager (non-compiled) mode (ms)
+    eager_time_ms: float = 0.0
     # ── accuracy: compiled vs eager (0.0 when not computed) ─────────────────
     # Outputs are cast to fp32 before comparison to avoid fp16 overflow.
     max_abs_err:  float = 0.0   # max element-wise absolute error
@@ -474,24 +476,53 @@ def _collect_kernel_times(
     all_tasks: list[tuple],
     device: str,
     backend: str,
-) -> dict[int, float]:
+) -> tuple[dict[int, float], dict[int, float]]:
     """
     Re-run every case sequentially in the main process and measure hardware
-    kernel execution time using device-side event clocks.
+    kernel execution time for both compiled and eager (non-compiled) modes
+    using device-side event clocks.
 
     This is intentionally separate from the main benchmark pass so that
     parallel workers (--workers > 1) do not execute kernels concurrently,
     which would skew device-side timing.
 
-    Each case is compiled fresh (caches reset before each run) and the
-    second call (compiled artifact reused) is timed.  TORCH_LOGS output
-    is suppressed to keep the output clean.
+    Returns (kernel_times, eager_times) — both indexed by task idx (ms).
+    TORCH_LOGS output is suppressed to keep the output clean.
     """
     import importlib
 
+    def _time_fn(fn, inputs, device):
+        """Return execution time of fn(*inputs) in ms using device-side clocks."""
+        if device == "cuda":
+            evt_s = torch.cuda.Event(enable_timing=True)
+            evt_e = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            evt_s.record()
+            with torch.no_grad():
+                fn(*inputs)
+            evt_e.record()
+            torch.cuda.synchronize()
+            return round(evt_s.elapsed_time(evt_e), 6)
+        elif device == "mlu":
+            evt_s = torch.mlu.Event(enable_timing=True)
+            evt_e = torch.mlu.Event(enable_timing=True)
+            torch.mlu.synchronize()
+            evt_s.record()
+            with torch.no_grad():
+                fn(*inputs)
+            evt_e.record()
+            torch.mlu.synchronize()
+            return round(evt_s.elapsed_time(evt_e), 6)
+        else:
+            t = time.perf_counter()
+            with torch.no_grad():
+                fn(*inputs)
+            return round((time.perf_counter() - t) * 1000.0, 6)
+
     n = len(all_tasks)
-    print(f"\n[kernel timing] {n} cases (sequential) …", flush=True)
+    print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
     kernel_times: dict[int, float] = {}
+    eager_times: dict[int, float] = {}
 
     for i, task in enumerate(all_tasks):
         idx, variant_name, module_path, fn_kwargs, device_, backend_, _ = task
@@ -501,44 +532,26 @@ def _collect_kernel_times(
             model, inputs = mod.get_model_and_input(**fn_kwargs, device=device)
             model.eval()
             compiled = torch.compile(model, backend=backend, fullgraph=False)
-            # first call: triggers compilation (not timed)
+
+            # warmup compiled (triggers compilation)
             with torch.no_grad():
                 compiled(*inputs)
-            # second call: timed with device-side event clocks
-            if device == "cuda":
-                evt_s = torch.cuda.Event(enable_timing=True)
-                evt_e = torch.cuda.Event(enable_timing=True)
-                torch.cuda.synchronize()
-                evt_s.record()
-                with torch.no_grad():
-                    compiled(*inputs)
-                evt_e.record()
-                torch.cuda.synchronize()
-                kernel_times[idx] = round(evt_s.elapsed_time(evt_e), 6)
-            elif device == "mlu":
-                evt_s = torch.mlu.Event(enable_timing=True)
-                evt_e = torch.mlu.Event(enable_timing=True)
-                torch.mlu.synchronize()
-                evt_s.record()
-                with torch.no_grad():
-                    compiled(*inputs)
-                evt_e.record()
-                torch.mlu.synchronize()
-                kernel_times[idx] = round(evt_s.elapsed_time(evt_e), 6)
-            else:
-                t = time.perf_counter()
-                with torch.no_grad():
-                    compiled(*inputs)
-                kernel_times[idx] = round((time.perf_counter() - t) * 1000.0, 6)
+            # warmup eager
+            with torch.no_grad():
+                model(*inputs)
+
+            kernel_times[idx] = _time_fn(compiled, inputs, device)
+            eager_times[idx]   = _time_fn(model,    inputs, device)
         except Exception:
             kernel_times[idx] = 0.0
+            eager_times[idx]  = 0.0
         finally:
             logging.disable(logging.NOTSET)
 
         if (i + 1) % 50 == 0 or (i + 1) == n:
             print(f"  [{i + 1}/{n}]", flush=True)
 
-    return kernel_times
+    return kernel_times, eager_times
 
 
 # ── statistics helpers ────────────────────────────────────────────────────────
@@ -547,12 +560,50 @@ def _collect_kernel_times(
 _STATS_EXCLUDE = {"sample", "device", "error"}
 
 
+_STAT_GROUPS: list[tuple[str, list[str]]] = [
+    ("Performance (ms)", [
+        "kernel_time_ms",
+        "eager_time_ms",
+        # speedup injected programmatically
+    ]),
+    ("Compilation (s)", [
+        "total_compile_s",
+        "dynamo_s",
+        "aot_s",
+        "backend_s",
+        "inductor_codegen_s",
+        "inductor_compile_s",
+        "inductor_load_s",
+    ]),
+    ("Graph Passes (s)", [
+        "pre_grad_passes_s",
+        "post_grad_passes_s",
+        "joint_graph_passes_s",
+    ]),
+    ("Wall-clock (s)", [
+        "first_call_s",
+        "second_call_s",
+    ]),
+    ("Counters", [
+        "cache_hit",
+        "graph_breaks",
+        "frames_compiled",
+    ]),
+    ("Accuracy (compiled vs eager)", [
+        "max_abs_err",
+        "mean_abs_err",
+        "max_rel_err",
+        "cosine_sim",
+    ]),
+]
+
+
 def _write_stats(results: list[BenchResult], out_path: Path) -> None:
     """
     Compute max / min / avg for every numeric column across all successful
     results and:
       1. Append three summary rows to the CSV (after the data rows).
-      2. Print a compact summary table to stdout.
+      2. Print a grouped summary table to stdout.
     """
     if not results:
         return
@@ -566,7 +617,6 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
         f.name for f in fields(BenchResult)
         if f.name not in _STATS_EXCLUDE and f.type in ("float", "int")
     ]
-    # Fall back: detect by actual type of first result
     if not numeric_fields:
         numeric_fields = [
             f.name for f in fields(BenchResult)
@@ -583,11 +633,24 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
             "avg": sum(vals) / len(vals),
         }
 
+    # ── compute speedup (eager / compiled) ───────────────────────────────────
+    speedup_vals = [
+        r.eager_time_ms / r.kernel_time_ms
+        for r in good
+        if r.kernel_time_ms > 0 and r.eager_time_ms > 0
+    ]
+    if speedup_vals:
+        stats["speedup (eager/compiled)"] = {
+            "max": max(speedup_vals),
+            "min": min(speedup_vals),
+            "avg": sum(speedup_vals) / len(speedup_vals),
+        }
+
     # ── append to CSV ────────────────────────────────────────────────────────
     header = BenchResult.csv_header()
     with out_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([])  # blank separator
+        writer.writerow([])
         for stat_name in ("max", "min", "avg"):
             row = []
             for col in header:
@@ -602,19 +665,45 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
                     row.append("")
             writer.writerow(row)
 
-    # ── print summary table ──────────────────────────────────────────────────
-    col_w = 18
-    label_w = 30
-    print(f"\n{'─' * (label_w + col_w * 3 + 6)}")
-    print(f"{'Statistics':>{label_w}}  {'max':>{col_w}}  {'min':>{col_w}}  {'avg':>{col_w}}")
-    print(f"{'─' * (label_w + col_w * 3 + 6)}")
-    for col in numeric_fields:
-        s = stats[col]
-        is_float = isinstance(s["avg"], float)
-        fmt = f"{{:>{col_w}.6f}}" if is_float else f"{{:>{col_w}}}"
-        print(f"{col:>{label_w}}  {fmt.format(s['max'])}  {fmt.format(s['min'])}  {fmt.format(s['avg'])}")
-    print(f"{'─' * (label_w + col_w * 3 + 6)}")
-    print(f"  (n={len(good)} successful cases)")
+    # ── print grouped summary table ──────────────────────────────────────────
+    col_w = 16
+    label_w = 32
+    total_w = label_w + col_w * 3 + 6
+
+    def _hdr(title: str) -> None:
+        print(f"\n╔{'═' * (total_w - 2)}╗")
+        print(f"║  {title:<{total_w - 4}}║")
+        print(f"╠{'═' * (total_w - 2)}╣")
+        print(f"║  {'':>{label_w - 2}}  {'max':>{col_w}}  {'min':>{col_w}}  {'avg':>{col_w}} ║")
+        print(f"╠{'─' * (total_w - 2)}╣")
+
+    def _row(label: str, col: str | None, is_float: bool = True) -> None:
+        if col is not None and col not in stats:
+            return
+        s = stats[col] if col is not None else stats[label]
+        fmt = f"{{:>{col_w}.6f}}" if is_float else f"{{:>{col_w}.0f}}"
+        print(f"║  {label:<{label_w - 2}}  {fmt.format(s['max'])}  {fmt.format(s['min'])}  {fmt.format(s['avg'])} ║")
+
+    def _footer() -> None:
+        print(f"╚{'═' * (total_w - 2)}╝")
+
+    has_accuracy = any(r.cosine_sim != 0.0 for r in good)
+
+    for group_title, cols in _STAT_GROUPS:
+        if group_title.startswith("Accuracy") and not has_accuracy:
+            continue
+        _hdr(group_title)
+        for col in cols:
+            if col not in stats:
+                continue
+            is_float = isinstance(stats[col]["avg"], float)
+            _row(col, col, is_float)
+            # inject speedup right after eager_time_ms
+            if col == "eager_time_ms" and "speedup (eager/compiled)" in stats:
+                _row("speedup (eager/compiled)", "speedup (eager/compiled)", True)
+        _footer()
+
+    print(f"\n  n={len(good)} successful cases  |  {len(results) - len(good)} errors")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -627,16 +716,17 @@ SAMPLES: dict[str, str] = {
 
 def _print_row(result: BenchResult) -> None:
     if result.error:
-        print(f"{result.sample:<40} ERROR: {result.error}")
+        print(f"{result.sample:<44} ERROR: {result.error}")
     else:
+        acc_str = f"  cos={result.cosine_sim:.6f}" if result.cosine_sim != 0.0 else ""
         print(
-            f"{result.sample:<40} {result.device:<6}"
-            f" {result.first_call_s:>10.4f}s"
-            f" {result.second_call_s:>10.4f}s"
-            f" {result.dynamo_s:>10.4f}s"
-            f" {result.aot_s:>10.4f}s"
-            f" {result.backend_s:>10.4f}s"
-            f" {result.total_compile_s:>10.4f}s"
+            f"{result.sample:<44} {result.device:<5}"
+            f" {result.first_call_s:>9.3f}s"
+            f" {result.second_call_s:>9.3f}s"
+            f" │ compile {result.total_compile_s:>8.3f}s"
+            f"  dynamo {result.dynamo_s:>7.3f}s"
+            f"  backend {result.backend_s:>7.3f}s"
+            f"{acc_str}"
         )
 
 
@@ -727,9 +817,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     n = len(all_tasks)
 
-    print(f"{'Sample':<40} {'Device':<6} {'1st call':>10} {'2nd call':>10} "
-          f"{'Dynamo':>10} {'AOT':>10} {'Backend':>10} {'Total cmp':>10}")
-    print("-" * 112)
+    print(f"{'Sample':<44} {'Dev':<5} {'1st call':>9} {'2nd call':>9}"
+          f"   {'Total cmp':>12}  {'Dynamo':>11}  {'Backend':>11}  {'cosine_sim'}")
+    print("-" * 125)
 
     # ordered_results[idx] = (BenchResult, logs)
     ordered_results: dict[int, tuple[BenchResult, str]] = {}
@@ -783,9 +873,10 @@ def main(argv: list[str] | None = None) -> None:
     # ── sequential kernel timing pass ───────────────────────────────────────
     # Always runs in the main process (single kernel at a time) so that
     # device-side event clocks are not disturbed by concurrent kernels.
-    kernel_times = _collect_kernel_times(all_tasks, args.device, args.backend)
-    for idx, kt in kernel_times.items():
-        ordered_results[idx][0].kernel_time_ms = kt
+    kernel_times, eager_times = _collect_kernel_times(all_tasks, args.device, args.backend)
+    for idx in range(n):
+        ordered_results[idx][0].kernel_time_ms = kernel_times.get(idx, 0.0)
+        ordered_results[idx][0].eager_time_ms  = eager_times.get(idx, 0.0)
 
     # ── write CSV in submission order ───────────────────────────────────────
     out_path = Path(args.output)
