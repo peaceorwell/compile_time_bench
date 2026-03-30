@@ -126,12 +126,8 @@ CPU 设备使用 wall-clock 计时。
 ## 使用方法
 
 ```bash
-# 在 CPU 上运行所有 case（默认）
+# 运行所有 case（自动检测设备：MLU > CUDA > CPU）
 python benchmark.py
-
-# 在 CUDA 或 MLU（寒武纪）上运行
-python benchmark.py --device cuda
-python benchmark.py --device mlu
 
 # 运行指定类别
 python benchmark.py --case_type gemm
@@ -150,6 +146,9 @@ python benchmark.py --workers 4
 
 # 自定义输出路径
 python benchmark.py --output results/my_run.csv
+
+# 显式指定设备
+python benchmark.py --device cpu
 
 # 指定 backend（默认：inductor）
 python benchmark.py --backend aot_eager
