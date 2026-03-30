@@ -684,27 +684,31 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
                     row.append("")
             writer.writerow(row)
 
-    # ── print grouped summary table ──────────────────────────────────────────
+    # ── build grouped summary table ───────────────────────────────────────────
     col_w = 16
     label_w = 32
     total_w = label_w + col_w * 3 + 6
+    buf = io.StringIO()
+
+    def _emit(line: str = "") -> None:
+        buf.write(line + "\n")
 
     def _hdr(title: str) -> None:
-        print(f"\n╔{'═' * (total_w - 2)}╗")
-        print(f"║  {title:<{total_w - 4}}║")
-        print(f"╠{'═' * (total_w - 2)}╣")
-        print(f"║  {'':>{label_w - 2}}  {'max':>{col_w}}  {'min':>{col_w}}  {'avg':>{col_w}} ║")
-        print(f"╠{'─' * (total_w - 2)}╣")
+        _emit(f"\n╔{'═' * (total_w - 2)}╗")
+        _emit(f"║  {title:<{total_w - 4}}║")
+        _emit(f"╠{'═' * (total_w - 2)}╣")
+        _emit(f"║  {'':>{label_w - 2}}  {'max':>{col_w}}  {'min':>{col_w}}  {'avg':>{col_w}} ║")
+        _emit(f"╠{'─' * (total_w - 2)}╣")
 
-    def _row(label: str, col: str | None, is_float: bool = True) -> None:
-        if col is not None and col not in stats:
+    def _row(label: str, col: str, is_float: bool = True) -> None:
+        if col not in stats:
             return
-        s = stats[col] if col is not None else stats[label]
+        s = stats[col]
         fmt = f"{{:>{col_w}.6f}}" if is_float else f"{{:>{col_w}.0f}}"
-        print(f"║  {label:<{label_w - 2}}  {fmt.format(s['max'])}  {fmt.format(s['min'])}  {fmt.format(s['avg'])} ║")
+        _emit(f"║  {label:<{label_w - 2}}  {fmt.format(s['max'])}  {fmt.format(s['min'])}  {fmt.format(s['avg'])} ║")
 
     def _footer() -> None:
-        print(f"╚{'═' * (total_w - 2)}╝")
+        _emit(f"╚{'═' * (total_w - 2)}╝")
 
     has_accuracy = any(r.cosine_sim != 0.0 for r in good)
 
@@ -717,12 +721,22 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
                 continue
             is_float = isinstance(stats[col]["avg"], float)
             _row(col, col, is_float)
-            # inject speedup right after eager_time_ms
             if col == "eager_time_ms" and "speedup (eager/compiled)" in stats:
                 _row("speedup (eager/compiled)", "speedup (eager/compiled)", True)
         _footer()
 
-    print(f"\n  n={len(good)} successful cases  |  {len(results) - len(good)} errors")
+    footer_line = f"\n  n={len(good)} successful cases  |  {len(results) - len(good)} errors"
+    _emit(footer_line)
+
+    table = buf.getvalue()
+
+    # ── print to stdout ───────────────────────────────────────────────────────
+    print(table, end="")
+
+    # ── write to summary file alongside the CSV ───────────────────────────────
+    summary_path = out_path.with_name(out_path.stem + "_summary.txt")
+    summary_path.write_text(table, encoding="utf-8")
+    print(f"Summary written to  : {summary_path.resolve()}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

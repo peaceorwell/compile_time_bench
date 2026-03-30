@@ -3,4 +3,5 @@ __pycache__/
 *.egg-info/
 .env
 compile_times.csv
+*_summary.txt
 logs/*.log
