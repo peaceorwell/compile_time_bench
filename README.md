@@ -114,7 +114,7 @@ Parallel workers are each pinned to a dedicated CPU core slice via
 | Pass | Purpose |
 |---|---|
 | 5th | Re-compiles using phase-1 disk cache (fast) |
-| 6th | Timed with `torch.{cuda,mlu}.Event.elapsed_time()` — records `kernel_time_ms` |
+| 6th | Timed with `torch.cuda.Event.elapsed_time()` — records `kernel_time_ms` |
 
 Running phase 2 serially ensures only one kernel executes at a time, giving
 accurate device-side hardware timing.  On CPU, wall-clock is used instead.
@@ -128,7 +128,7 @@ table to stdout.
 ## Usage
 
 ```bash
-# Run all cases (device auto-detected: MLU > CUDA > CPU)
+# Run all cases (device auto-detected: CUDA if available, otherwise CPU)
 python benchmark.py
 
 # Run a specific case type
