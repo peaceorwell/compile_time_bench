@@ -515,18 +515,27 @@ def _collect_kernel_times(
 
     def _time_fn(fn, inputs, device):
         """
-        Return execution time of fn(*inputs) in ms.
+        Return average execution time of fn(*inputs) in ms over 10 steps.
 
-        For CPU: wall-clock time.
-        For CUDA/MLU: torch.profiler device-kernel time, which works uniformly
-        across both without device-specific Event API branches.
+        For CPU: wall-clock average over 10 runs.
+        For CUDA/MLU: torch.profiler with schedule(wait=2, warmup=2, active=10),
+        device_time_us averaged across the 10 active steps.
         """
+        _WAIT    = 2
+        _WARMUP  = 2
+        _ACTIVE  = 10
+        _TOTAL   = _WAIT + _WARMUP + _ACTIVE
+
         if device == "cpu":
-            _sync_device(device)
+            # run TOTAL times; average last ACTIVE
+            for _ in range(_WAIT + _WARMUP):
+                with torch.no_grad():
+                    fn(*inputs)
             t = time.perf_counter()
-            with torch.no_grad():
-                fn(*inputs)
-            return round((time.perf_counter() - t) * 1000.0, 6)
+            for _ in range(_ACTIVE):
+                with torch.no_grad():
+                    fn(*inputs)
+            return round((time.perf_counter() - t) * 1000.0 / _ACTIVE, 6)
 
         activities = [torch.profiler.ProfilerActivity.CPU]
         if device == "cuda":
@@ -539,22 +548,27 @@ def _collect_kernel_times(
 
         with torch.profiler.profile(
             activities=activities,
+            schedule=torch.profiler.schedule(
+                wait=_WAIT, warmup=_WARMUP, active=_ACTIVE, repeat=1,
+            ),
             record_shapes=False,
             with_flops=False,
         ) as prof:
-            with torch.no_grad():
-                fn(*inputs)
+            for _ in range(_TOTAL):
+                with torch.no_grad():
+                    fn(*inputs)
+                prof.step()
 
-        # Sum device-side kernel time across all events (µs → ms)
+        # Average device-side kernel time across active steps (µs → ms)
         total_us = sum(
             e.device_time_us for e in prof.key_averages()
             if e.device_time_us > 0
         )
         if total_us > 0:
-            return round(total_us / 1000.0, 6)
-        # Fallback to CPU time if device events are unavailable
+            return round(total_us / 1000.0 / _ACTIVE, 6)
+        # Fallback to CPU time if no device events recorded
         cpu_us = sum(e.cpu_time_us for e in prof.key_averages())
-        return round(cpu_us / 1000.0, 6)
+        return round(cpu_us / 1000.0 / _ACTIVE, 6)
 
     n = len(all_tasks)
     print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
