@@ -121,6 +121,17 @@ def _detect_device() -> str:
     return "cpu"
 
 
+def _sync_device(device: str) -> None:
+    """Synchronize the given device; no-op on CPU."""
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "mlu":
+        try:
+            torch.mlu.synchronize()
+        except AttributeError:
+            pass
+
+
 # ── warmup ───────────────────────────────────────────────────────────────────
 
 def _warmup(device: str) -> None:
@@ -360,27 +371,19 @@ def _run_sample(
         compiled = torch.compile(model, backend=backend, fullgraph=False)
 
         # ── first call: triggers full compilation ──
+        _sync_device(device)
         t0 = time.perf_counter()
         with torch.no_grad():
             compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
+        _sync_device(device)
         result.first_call_s = time.perf_counter() - t0
 
         # ── second call: compiled artifact is reused ──────────────────────
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
+        _sync_device(device)
         t1 = time.perf_counter()
         with torch.no_grad():
             compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
+        _sync_device(device)
         result.second_call_s = time.perf_counter() - t1
         # kernel_time_ms is left as 0.0 here; filled in by _collect_kernel_times
         # after the main benchmark pass so that parallel runs don't cause
@@ -511,32 +514,47 @@ def _collect_kernel_times(
     import importlib
 
     def _time_fn(fn, inputs, device):
-        """Return execution time of fn(*inputs) in ms using device-side clocks."""
-        if device == "cuda":
-            evt_s = torch.cuda.Event(enable_timing=True)
-            evt_e = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            evt_s.record()
-            with torch.no_grad():
-                fn(*inputs)
-            evt_e.record()
-            torch.cuda.synchronize()
-            return round(evt_s.elapsed_time(evt_e), 6)
-        elif device == "mlu":
-            evt_s = torch.mlu.Event(enable_timing=True)
-            evt_e = torch.mlu.Event(enable_timing=True)
-            torch.mlu.synchronize()
-            evt_s.record()
-            with torch.no_grad():
-                fn(*inputs)
-            evt_e.record()
-            torch.mlu.synchronize()
-            return round(evt_s.elapsed_time(evt_e), 6)
-        else:
+        """
+        Return execution time of fn(*inputs) in ms.
+
+        For CPU: wall-clock time.
+        For CUDA/MLU: torch.profiler device-kernel time, which works uniformly
+        across both without device-specific Event API branches.
+        """
+        if device == "cpu":
+            _sync_device(device)
             t = time.perf_counter()
             with torch.no_grad():
                 fn(*inputs)
             return round((time.perf_counter() - t) * 1000.0, 6)
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        elif device == "mlu":
+            try:
+                activities.append(torch.profiler.ProfilerActivity.MLU)
+            except AttributeError:
+                pass
+
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=False,
+            with_flops=False,
+        ) as prof:
+            with torch.no_grad():
+                fn(*inputs)
+
+        # Sum device-side kernel time across all events (µs → ms)
+        total_us = sum(
+            e.device_time_us for e in prof.key_averages()
+            if e.device_time_us > 0
+        )
+        if total_us > 0:
+            return round(total_us / 1000.0, 6)
+        # Fallback to CPU time if device events are unavailable
+        cpu_us = sum(e.cpu_time_us for e in prof.key_averages())
+        return round(cpu_us / 1000.0, 6)
 
     n = len(all_tasks)
     print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
