@@ -38,6 +38,13 @@ import torch
 import torch._dynamo
 import torch._dynamo.utils as _dynamo_utils
 
+import torch.profiler as profiler
+
+torch._inductor.config.max_autotune_gemm_backends = "TRITON"
+torch._inductor.config.max_autotune = True
+torch._inductor.config.prologue_fusion = True
+
+
 # ── Disable compilation caches so every sample is compiled fresh ────────────
 # Without this, AOTAutogradCache / FX graph cache can produce cache hits that
 # hide the real inductor compilation time.
@@ -52,6 +59,44 @@ try:
     _inductor_cfg.fx_graph_remote_cache = False
 except Exception:
     pass
+
+
+def get_device_time(events):
+    from torch.autograd import DeviceType
+
+    sum_self_device_time_total = 0
+    sum_device_kernel_total = 0
+    for evt in events:
+        if (
+            evt.device_type in [DeviceType.PrivateUse1]
+            and not evt.is_user_annotation
+        ):
+            sum_self_device_time_total += evt.self_device_time_total
+            sum_device_kernel_total += evt.count
+    return sum_self_device_time_total / 1000.0 / 10, sum_device_kernel_total
+
+
+def profile_benchmark(fn, device):
+    assert hasattr(profiler.ProfilerActivity, device)
+    activity = getattr(profiler.ProfilerActivity, device)
+    with profiler.profile(
+            activities=[
+                profiler.ProfilerActivity.CPU,
+                activity,
+                ],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./perf_log_eager"),
+            schedule=torch.profiler.schedule(
+                wait = 1,
+                warmup = 3,
+                active = 10),
+            with_stack=True,
+            ) as p:
+        for i in range(0, 14):
+            fn()
+            p.step()
+            torch.mlu.synchronize()
+    device_time_ms, kernel_nums = get_device_time(p.key_averages())
+    return device_time_ms
 
 # ── per-sample cache reset ──────────────────────────────────────────────────
 
@@ -511,32 +556,10 @@ def _collect_kernel_times(
     import importlib
 
     def _time_fn(fn, inputs, device):
+        torch._dynamo.reset()
         """Return execution time of fn(*inputs) in ms using device-side clocks."""
-        if device == "cuda":
-            evt_s = torch.cuda.Event(enable_timing=True)
-            evt_e = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            evt_s.record()
-            with torch.no_grad():
-                fn(*inputs)
-            evt_e.record()
-            torch.cuda.synchronize()
-            return round(evt_s.elapsed_time(evt_e), 6)
-        elif device == "mlu":
-            evt_s = torch.mlu.Event(enable_timing=True)
-            evt_e = torch.mlu.Event(enable_timing=True)
-            torch.mlu.synchronize()
-            evt_s.record()
-            with torch.no_grad():
-                fn(*inputs)
-            evt_e.record()
-            torch.mlu.synchronize()
-            return round(evt_s.elapsed_time(evt_e), 6)
-        else:
-            t = time.perf_counter()
-            with torch.no_grad():
-                fn(*inputs)
-            return round((time.perf_counter() - t) * 1000.0, 6)
+        with torch.no_grad():
+            return round(profile_benchmark(lambda: fn(*inputs), device.upper()), 6)
 
     n = len(all_tasks)
     print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
@@ -552,16 +575,9 @@ def _collect_kernel_times(
             model.eval()
             compiled = torch.compile(model, backend=backend, fullgraph=False)
 
-            # warmup compiled (triggers compilation)
-            with torch.no_grad():
-                compiled(*inputs)
-            # warmup eager
-            with torch.no_grad():
-                model(*inputs)
-
             kernel_times[idx] = _time_fn(compiled, inputs, device)
             eager_times[idx]   = _time_fn(model,    inputs, device)
-        except Exception:
+        except Exception as e:
             kernel_times[idx] = 0.0
             eager_times[idx]  = 0.0
         finally:
