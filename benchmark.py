@@ -672,10 +672,13 @@ def _compute_stats(good: list[BenchResult]) -> dict[str, dict[str, float]]:
         if r.kernel_time_ms > 0 and r.eager_time_ms > 0
     ]
     if speedup_vals:
+        avg_kernel = stats.get("kernel_time_ms", {}).get("avg", 0.0)
+        avg_eager  = stats.get("eager_time_ms",  {}).get("avg", 0.0)
+        avg_speedup = (avg_eager / avg_kernel) if avg_kernel > 0 else 0.0
         stats["speedup (eager/compiled)"] = {
             "max": max(speedup_vals),
             "min": min(speedup_vals),
-            "avg": sum(speedup_vals) / len(speedup_vals),
+            "avg": avg_speedup,
         }
     return stats
 
