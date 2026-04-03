@@ -571,7 +571,8 @@ def _collect_kernel_times(
         return round(cpu_us / 1000.0 / _ACTIVE, 6)
 
     n = len(all_tasks)
-    print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
+    if n > 1:
+        print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
     kernel_times: dict[int, float] = {}
     eager_times: dict[int, float] = {}
 
@@ -599,7 +600,7 @@ def _collect_kernel_times(
         finally:
             logging.disable(logging.NOTSET)
 
-        if (i + 1) % 50 == 0 or (i + 1) == n:
+        if n > 1 and (i + 1) % 50 == 0:
             print(f"  [{i + 1}/{n}]", flush=True)
 
     return kernel_times, eager_times
@@ -965,7 +966,6 @@ def main(argv: list[str] | None = None) -> None:
     _write_stats(all_results, out_path)
 
     print(f"\nResults written to: {out_path.resolve()}")
-    print(f"Per-sample logs  : {logs_dir.resolve()}/")
 
 
 if __name__ == "__main__":
