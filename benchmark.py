@@ -674,11 +674,17 @@ def _compute_stats(good: list[BenchResult]) -> dict[str, dict[str, float]]:
     if speedup_vals:
         avg_kernel = stats.get("kernel_time_ms", {}).get("avg", 0.0)
         avg_eager  = stats.get("eager_time_ms",  {}).get("avg", 0.0)
-        avg_speedup = (avg_eager / avg_kernel) if avg_kernel > 0 else 0.0
-        stats["speedup (eager/compiled)"] = {
+        # per-sample ratio stats (max/min meaningful; avg = mean of ratios)
+        stats["speedup per-sample (eager/compiled)"] = {
             "max": max(speedup_vals),
             "min": min(speedup_vals),
-            "avg": avg_speedup,
+            "avg": sum(speedup_vals) / len(speedup_vals),
+        }
+        # ratio of averages (more representative overall speedup)
+        stats["speedup avg(eager)/avg(compiled)"] = {
+            "max": max(speedup_vals),
+            "min": min(speedup_vals),
+            "avg": (avg_eager / avg_kernel) if avg_kernel > 0 else 0.0,
         }
     return stats
 
@@ -731,8 +737,9 @@ def _render_stats_section(
             if col not in stats:
                 continue
             _row(col, col, isinstance(stats[col]["avg"], float))
-            if col == "eager_time_ms" and "speedup (eager/compiled)" in stats:
-                _row("speedup (eager/compiled)", "speedup (eager/compiled)", True)
+            if col == "eager_time_ms":
+                _row("speedup per-sample avg", "speedup per-sample (eager/compiled)", True)
+                _row("speedup avg(eager)/avg(compiled)", "speedup avg(eager)/avg(compiled)", True)
         _footer()
 
     if n_total > n_good:
