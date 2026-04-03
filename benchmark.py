@@ -986,8 +986,8 @@ def main(argv: list[str] | None = None) -> None:
     sample_to_type: dict[str, str] = {}
     for task in all_tasks:
         _, variant_name, module_path, *_ = task
-        for ct, mp in SAMPLES.items():
-            if mp == module_path:
+        for ct, mod_path in SAMPLES.items():
+            if mod_path == module_path:
                 sample_to_type[variant_name] = ct
                 break
 
