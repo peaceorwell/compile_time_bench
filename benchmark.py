@@ -559,15 +559,15 @@ def _collect_kernel_times(
                     fn(*inputs)
                 prof.step()
 
-        # Average device-side kernel time across active steps (µs → ms)
+        # Sum self device time across active steps (µs), average per step → ms
         total_us = sum(
-            e.device_time_us for e in prof.key_averages()
-            if e.device_time_us > 0
+            e.self_device_time_total for e in prof.key_averages()
+            if e.self_device_time_total > 0
         )
         if total_us > 0:
             return round(total_us / 1000.0 / _ACTIVE, 6)
-        # Fallback to CPU time if no device events recorded
-        cpu_us = sum(e.cpu_time_us for e in prof.key_averages())
+        # Fallback: self CPU time if no device events recorded
+        cpu_us = sum(e.self_cpu_time_total for e in prof.key_averages())
         return round(cpu_us / 1000.0 / _ACTIVE, 6)
 
     n = len(all_tasks)
@@ -650,21 +650,8 @@ _STAT_GROUPS: list[tuple[str, list[str]]] = [
 ]
 
 
-def _write_stats(results: list[BenchResult], out_path: Path) -> None:
-    """
-    Compute max / min / avg for every numeric column across all successful
-    results and:
-      1. Append three summary rows to the CSV (after the data rows).
-      2. Print a grouped summary table to stdout.
-    """
-    if not results:
-        return
-
-    good = [r for r in results if not r.error]
-    if not good:
-        print("\n[stats] No successful results to summarise.")
-        return
-
+def _compute_stats(good: list[BenchResult]) -> dict[str, dict[str, float]]:
+    """Compute max/min/avg for every numeric field plus speedup."""
     numeric_fields = [
         f.name for f in fields(BenchResult)
         if f.name not in _STATS_EXCLUDE and f.type in ("float", "int")
@@ -675,17 +662,10 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
             if f.name not in _STATS_EXCLUDE
             and isinstance(getattr(good[0], f.name), (int, float))
         ]
-
     stats: dict[str, dict[str, float]] = {}
     for col in numeric_fields:
         vals = [getattr(r, col) for r in good]
-        stats[col] = {
-            "max": max(vals),
-            "min": min(vals),
-            "avg": sum(vals) / len(vals),
-        }
-
-    # ── compute speedup (eager / compiled) ───────────────────────────────────
+        stats[col] = {"max": max(vals), "min": min(vals), "avg": sum(vals) / len(vals)}
     speedup_vals = [
         r.eager_time_ms / r.kernel_time_ms
         for r in good
@@ -697,27 +677,16 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
             "min": min(speedup_vals),
             "avg": sum(speedup_vals) / len(speedup_vals),
         }
+    return stats
 
-    # ── append to CSV ────────────────────────────────────────────────────────
-    header = BenchResult.csv_header()
-    with out_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([])
-        for stat_name in ("max", "min", "avg"):
-            row = []
-            for col in header:
-                if col == "sample":
-                    row.append(f"[{stat_name}]")
-                elif col == "device":
-                    row.append("")
-                elif col in stats:
-                    v = stats[col][stat_name]
-                    row.append(f"{v:.6f}" if isinstance(v, float) else v)
-                else:
-                    row.append("")
-            writer.writerow(row)
 
-    # ── build grouped summary table ───────────────────────────────────────────
+def _render_stats_section(
+    stats: dict[str, dict[str, float]],
+    section_title: str,
+    n_good: int,
+    n_total: int,
+) -> str:
+    """Render one grouped stats block (all _STAT_GROUPS) as a string."""
     col_w = 16
     label_w = 32
     total_w = label_w + col_w * 3 + 9
@@ -725,6 +694,11 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
 
     def _emit(line: str = "") -> None:
         buf.write(line + "\n")
+
+    sep = "━" * total_w
+    _emit(f"\n{sep}")
+    _emit(f"  {section_title}  (n={n_good})")
+    _emit(sep)
 
     def _hdr(title: str) -> None:
         _emit(f"\n╔{'═' * (total_w - 2)}╗")
@@ -743,7 +717,8 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
     def _footer() -> None:
         _emit(f"╚{'═' * (total_w - 2)}╝")
 
-    has_accuracy = any(r.cosine_sim != 0.0 for r in good)
+    has_accuracy = any(col in stats and stats[col]["max"] != 0.0
+                       for col in ("cosine_sim", "max_abs_err"))
 
     for group_title, cols in _STAT_GROUPS:
         if group_title.startswith("Accuracy") and not has_accuracy:
@@ -752,21 +727,66 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
         for col in cols:
             if col not in stats:
                 continue
-            is_float = isinstance(stats[col]["avg"], float)
-            _row(col, col, is_float)
+            _row(col, col, isinstance(stats[col]["avg"], float))
             if col == "eager_time_ms" and "speedup (eager/compiled)" in stats:
                 _row("speedup (eager/compiled)", "speedup (eager/compiled)", True)
         _footer()
 
-    footer_line = f"\n  n={len(good)} successful cases  |  {len(results) - len(good)} errors"
-    _emit(footer_line)
+    if n_total > n_good:
+        _emit(f"\n  {n_total - n_good} error(s) excluded from statistics")
+
+    return buf.getvalue()
+
+
+def _write_stats(
+    results: list[BenchResult],
+    out_path: Path,
+    sample_to_type: dict[str, str] | None = None,
+) -> None:
+    """
+    Compute statistics and write to <stem>_summary.txt.
+    Stats are grouped by case_type when sample_to_type is provided.
+    No stats rows are appended to the CSV.
+    """
+    if not results:
+        return
+
+    good = [r for r in results if not r.error]
+    if not good:
+        print("\n[stats] No successful results to summarise.")
+        return
+
+    buf = io.StringIO()
+
+    # ── per-case_type sections ────────────────────────────────────────────────
+    if sample_to_type:
+        # group results by case_type, preserving insertion order
+        type_groups: dict[str, list[BenchResult]] = {}
+        for r in good:
+            ct = sample_to_type.get(r.sample, "other")
+            type_groups.setdefault(ct, []).append(r)
+
+        for ct, ct_results in type_groups.items():
+            stats = _compute_stats(ct_results)
+            buf.write(_render_stats_section(
+                stats, ct, len(ct_results),
+                sum(1 for r in results if sample_to_type.get(r.sample) == ct),
+            ))
+
+        # overall section only when there are multiple types
+        if len(type_groups) > 1:
+            stats = _compute_stats(good)
+            buf.write(_render_stats_section(stats, "overall", len(good), len(results)))
+    else:
+        stats = _compute_stats(good)
+        buf.write(_render_stats_section(stats, "overall", len(good), len(results)))
 
     table = buf.getvalue()
 
     # ── print to stdout ───────────────────────────────────────────────────────
     print(table, end="")
 
-    # ── write to summary file alongside the CSV ───────────────────────────────
+    # ── write summary file (stats only, separate from CSV) ───────────────────
     summary_path = out_path.with_name(out_path.stem + "_summary.txt")
     summary_path.write_text(table, encoding="utf-8")
     print(f"Summary written to  : {summary_path.resolve()}")
@@ -962,8 +982,17 @@ def main(argv: list[str] | None = None) -> None:
             writer.writerow(result.csv_row())
 
     # ── compute and append statistics ───────────────────────────────────────
+    # build sample→case_type map from task list for per-type stats grouping
+    sample_to_type: dict[str, str] = {}
+    for task in all_tasks:
+        _, variant_name, module_path, *_ = task
+        for ct, mp in SAMPLES.items():
+            if mp == module_path:
+                sample_to_type[variant_name] = ct
+                break
+
     all_results = [ordered_results[i][0] for i in range(n)]
-    _write_stats(all_results, out_path)
+    _write_stats(all_results, out_path, sample_to_type)
 
     print(f"\nResults written to: {out_path.resolve()}")
 
