@@ -431,22 +431,95 @@ def _run_sample(
 
 # ── subprocess worker (module-level so it is picklable) ──────────────────────
 
+def _parse_cpulist(s: str) -> list[int]:
+    """Parse a Linux cpulist string, e.g. '0-3,8-11' → [0,1,2,3,8,9,10,11]."""
+    cpus: list[int] = []
+    for part in s.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            cpus.extend(range(int(a), int(b) + 1))
+        elif part:
+            cpus.append(int(part))
+    return cpus
+
+
+def _get_numa_nodes() -> dict[int, list[int]]:
+    """
+    Read NUMA node → CPU list from /sys/devices/system/node/nodeN/cpulist.
+
+    Returns an empty dict on systems without NUMA sysfs (macOS, Windows,
+    containers without /sys mounted, single-socket machines).
+    """
+    node_dir = Path("/sys/devices/system/node")
+    if not node_dir.exists():
+        return {}
+    nodes: dict[int, list[int]] = {}
+    for p in sorted(node_dir.glob("node[0-9]*")):
+        cpulist_file = p / "cpulist"
+        if cpulist_file.exists():
+            try:
+                node_id = int(p.name[4:])
+                nodes[node_id] = _parse_cpulist(cpulist_file.read_text().strip())
+            except (ValueError, OSError):
+                pass
+    return nodes
+
+
 def _pin_worker_to_cores(slot: int, n_workers: int) -> None:
     """
-    Pin the current process to a dedicated subset of available CPU cores.
+    Pin the current process to a dedicated subset of available CPU cores,
+    respecting NUMA topology when possible.
 
-    Divides the set of CPUs visible to this process evenly among workers.
-    Each worker slot gets an exclusive slice so that workers do not share
-    physical cores, which reduces scheduler preemption and L1/L2 cache
-    thrashing during compilation.
+    Strategy
+    --------
+    1. Read NUMA node layout from /sys/devices/system/node (Linux only).
+    2. Distribute workers evenly across NUMA nodes so that each worker's
+       CPU slice is fully contained within one node, avoiding cross-node
+       memory-access penalties that inflate and skew compile-phase timings.
+    3. Within each node, further subdivide cores among workers that share
+       the node.
+    4. Fall back to the plain sequential-slice approach when NUMA info is
+       unavailable (macOS, Windows, single-socket, sandboxed environments).
 
-    No-op on systems without sched_setaffinity (macOS, Windows, sandboxed
-    environments) — falls back silently.
+    Example — 2 NUMA nodes × 32 cores, --workers 4
+    -----------------------------------------------
+      node 0 CPUs: 0-31  → worker 0: 0-15, worker 1: 16-31
+      node 1 CPUs: 32-63 → worker 2: 32-47, worker 3: 48-63
+
+    No-op on systems without sched_setaffinity — falls back silently.
     """
     try:
         available = sorted(os.sched_getaffinity(0))
         if len(available) <= 1:
             return
+
+        numa_nodes = _get_numa_nodes()
+        if numa_nodes and len(numa_nodes) > 1:
+            # Filter each node's CPUs to only those visible to this process
+            node_ids = sorted(numa_nodes)
+            available_set = set(available)
+            node_cpus: dict[int, list[int]] = {
+                nid: sorted(set(numa_nodes[nid]) & available_set)
+                for nid in node_ids
+            }
+            # Drop nodes with no visible CPUs
+            node_cpus = {nid: cpus for nid, cpus in node_cpus.items() if cpus}
+            n_nodes = len(node_cpus)
+            if n_nodes > 1:
+                node_ids = sorted(node_cpus)
+                node_idx   = slot % n_nodes
+                inner_slot = slot // n_nodes
+                # workers that land on this node
+                workers_on_node = max(1, n_workers // n_nodes)
+                cpus = node_cpus[node_ids[node_idx]]
+                cpus_per = max(1, len(cpus) // workers_on_node)
+                start = inner_slot * cpus_per
+                assigned = set(cpus[start: start + cpus_per])
+                os.sched_setaffinity(0, assigned)
+                return
+
+        # Fallback: plain sequential slice (no NUMA info or single-node)
         cores_per_worker = max(1, len(available) // n_workers)
         start = (slot % n_workers) * cores_per_worker
         assigned = set(available[start: start + cores_per_worker])
