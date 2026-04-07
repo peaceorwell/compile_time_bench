@@ -571,8 +571,7 @@ def _collect_kernel_times(
         return round(cpu_us / 1000.0 / _ACTIVE, 6)
 
     n = len(all_tasks)
-    if n > 1:
-        print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
+    print(f"\n[kernel timing] {n} case(s) — compiled vs eager (sequential) …", flush=True)
     kernel_times: dict[int, float] = {}
     eager_times: dict[int, float] = {}
 
@@ -594,9 +593,11 @@ def _collect_kernel_times(
 
             kernel_times[idx] = _time_fn(compiled, inputs, device)
             eager_times[idx]   = _time_fn(model,    inputs, device)
-        except Exception:
+        except Exception as exc:
             kernel_times[idx] = 0.0
             eager_times[idx]  = 0.0
+            logging.disable(logging.NOTSET)
+            print(f"  [warn] kernel timing failed for {variant_name}: {exc}", flush=True)
         finally:
             logging.disable(logging.NOTSET)
 
@@ -680,10 +681,11 @@ def _compute_stats(good: list[BenchResult]) -> dict[str, dict[str, float]]:
             "min": min(speedup_vals),
             "avg": sum(speedup_vals) / len(speedup_vals),
         }
-        # ratio of averages (more representative overall speedup)
+        # ratio of averages (more representative overall speedup);
+        # max/min are not meaningful for this aggregate metric
         stats["speedup avg(eager)/avg(compiled)"] = {
-            "max": max(speedup_vals),
-            "min": min(speedup_vals),
+            "max": None,
+            "min": None,
             "avg": (avg_eager / avg_kernel) if avg_kernel > 0 else 0.0,
         }
     return stats
@@ -721,7 +723,9 @@ def _render_stats_section(
             return
         s = stats[col]
         fmt = f"{{:>{col_w}.6f}}" if is_float else f"{{:>{col_w}.0f}}"
-        _emit(f"║  {label:<{label_w - 2}}  {fmt.format(s['max'])}  {fmt.format(s['min'])}  {fmt.format(s['avg'])} ║")
+        def _fmt(v) -> str:
+            return f"{'--':>{col_w}}" if v is None else fmt.format(v)
+        _emit(f"║  {label:<{label_w - 2}}  {_fmt(s['max'])}  {_fmt(s['min'])}  {_fmt(s['avg'])} ║")
 
     def _footer() -> None:
         _emit(f"╚{'═' * (total_w - 2)}╝")

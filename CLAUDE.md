@@ -19,7 +19,7 @@ results/              – suggested directory for output CSV files
 - Phase 1 uses `_reset_all_caches()` before each case; Phase 2 reuses Phase 1 disk cache
 - Compile-phase metrics extracted from `torch._dynamo.utils.compilation_time_metrics`
 - Accuracy: compiled output vs. eager output, cast to fp32, metrics: max_abs_err, mean_abs_err, max_rel_err, cosine_sim
-- Kernel timing: `torch.{cuda,mlu}.Event.elapsed_time()` (device) or wall-clock (CPU)
+- Kernel timing: `torch.profiler` with `schedule(wait=2, warmup=2, active=10)` (device); wall-clock average (CPU)
 - Parallel workers pinned to dedicated CPU cores via `os.sched_setaffinity`
 
 ## Running
