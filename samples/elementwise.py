@@ -58,6 +58,9 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
+# ── flag consumed by benchmark._build_tasks ───────────────────────────────────
+COMPUTE_ACCURACY = True
+
 # ── axis sizes ────────────────────────────────────────────────────────────────
 N_INPUTS_CHOICES  = [1, 2, 3, 4]
 N_OUTPUTS_CHOICES = [1, 2, 3, 4]

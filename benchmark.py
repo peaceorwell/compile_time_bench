@@ -121,6 +121,17 @@ def _detect_device() -> str:
     return "cpu"
 
 
+def _sync_device(device: str) -> None:
+    """Synchronize the given device; no-op on CPU."""
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "mlu":
+        try:
+            torch.mlu.synchronize()
+        except AttributeError:
+            pass
+
+
 # ── warmup ───────────────────────────────────────────────────────────────────
 
 def _warmup(device: str) -> None:
@@ -360,27 +371,19 @@ def _run_sample(
         compiled = torch.compile(model, backend=backend, fullgraph=False)
 
         # ── first call: triggers full compilation ──
+        _sync_device(device)
         t0 = time.perf_counter()
         with torch.no_grad():
             compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
+        _sync_device(device)
         result.first_call_s = time.perf_counter() - t0
 
         # ── second call: compiled artifact is reused ──────────────────────
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
+        _sync_device(device)
         t1 = time.perf_counter()
         with torch.no_grad():
             compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
+        _sync_device(device)
         result.second_call_s = time.perf_counter() - t1
         # kernel_time_ms is left as 0.0 here; filled in by _collect_kernel_times
         # after the main benchmark pass so that parallel runs don't cause
@@ -428,22 +431,95 @@ def _run_sample(
 
 # ── subprocess worker (module-level so it is picklable) ──────────────────────
 
+def _parse_cpulist(s: str) -> list[int]:
+    """Parse a Linux cpulist string, e.g. '0-3,8-11' → [0,1,2,3,8,9,10,11]."""
+    cpus: list[int] = []
+    for part in s.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            cpus.extend(range(int(a), int(b) + 1))
+        elif part:
+            cpus.append(int(part))
+    return cpus
+
+
+def _get_numa_nodes() -> dict[int, list[int]]:
+    """
+    Read NUMA node → CPU list from /sys/devices/system/node/nodeN/cpulist.
+
+    Returns an empty dict on systems without NUMA sysfs (macOS, Windows,
+    containers without /sys mounted, single-socket machines).
+    """
+    node_dir = Path("/sys/devices/system/node")
+    if not node_dir.exists():
+        return {}
+    nodes: dict[int, list[int]] = {}
+    for p in sorted(node_dir.glob("node[0-9]*")):
+        cpulist_file = p / "cpulist"
+        if cpulist_file.exists():
+            try:
+                node_id = int(p.name[4:])
+                nodes[node_id] = _parse_cpulist(cpulist_file.read_text().strip())
+            except (ValueError, OSError):
+                pass
+    return nodes
+
+
 def _pin_worker_to_cores(slot: int, n_workers: int) -> None:
     """
-    Pin the current process to a dedicated subset of available CPU cores.
+    Pin the current process to a dedicated subset of available CPU cores,
+    respecting NUMA topology when possible.
 
-    Divides the set of CPUs visible to this process evenly among workers.
-    Each worker slot gets an exclusive slice so that workers do not share
-    physical cores, which reduces scheduler preemption and L1/L2 cache
-    thrashing during compilation.
+    Strategy
+    --------
+    1. Read NUMA node layout from /sys/devices/system/node (Linux only).
+    2. Distribute workers evenly across NUMA nodes so that each worker's
+       CPU slice is fully contained within one node, avoiding cross-node
+       memory-access penalties that inflate and skew compile-phase timings.
+    3. Within each node, further subdivide cores among workers that share
+       the node.
+    4. Fall back to the plain sequential-slice approach when NUMA info is
+       unavailable (macOS, Windows, single-socket, sandboxed environments).
 
-    No-op on systems without sched_setaffinity (macOS, Windows, sandboxed
-    environments) — falls back silently.
+    Example — 2 NUMA nodes × 32 cores, --workers 4
+    -----------------------------------------------
+      node 0 CPUs: 0-31  → worker 0: 0-15, worker 1: 16-31
+      node 1 CPUs: 32-63 → worker 2: 32-47, worker 3: 48-63
+
+    No-op on systems without sched_setaffinity — falls back silently.
     """
     try:
         available = sorted(os.sched_getaffinity(0))
         if len(available) <= 1:
             return
+
+        numa_nodes = _get_numa_nodes()
+        if numa_nodes and len(numa_nodes) > 1:
+            # Filter each node's CPUs to only those visible to this process
+            node_ids = sorted(numa_nodes)
+            available_set = set(available)
+            node_cpus: dict[int, list[int]] = {
+                nid: sorted(set(numa_nodes[nid]) & available_set)
+                for nid in node_ids
+            }
+            # Drop nodes with no visible CPUs
+            node_cpus = {nid: cpus for nid, cpus in node_cpus.items() if cpus}
+            n_nodes = len(node_cpus)
+            if n_nodes > 1:
+                node_ids = sorted(node_cpus)
+                node_idx   = slot % n_nodes
+                inner_slot = slot // n_nodes
+                # workers that land on this node
+                workers_on_node = max(1, n_workers // n_nodes)
+                cpus = node_cpus[node_ids[node_idx]]
+                cpus_per = max(1, len(cpus) // workers_on_node)
+                start = inner_slot * cpus_per
+                assigned = set(cpus[start: start + cpus_per])
+                os.sched_setaffinity(0, assigned)
+                return
+
+        # Fallback: plain sequential slice (no NUMA info or single-node)
         cores_per_worker = max(1, len(available) // n_workers)
         start = (slot % n_workers) * cores_per_worker
         assigned = set(available[start: start + cores_per_worker])
@@ -511,35 +587,64 @@ def _collect_kernel_times(
     import importlib
 
     def _time_fn(fn, inputs, device):
-        """Return execution time of fn(*inputs) in ms using device-side clocks."""
-        if device == "cuda":
-            evt_s = torch.cuda.Event(enable_timing=True)
-            evt_e = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            evt_s.record()
-            with torch.no_grad():
-                fn(*inputs)
-            evt_e.record()
-            torch.cuda.synchronize()
-            return round(evt_s.elapsed_time(evt_e), 6)
-        elif device == "mlu":
-            evt_s = torch.mlu.Event(enable_timing=True)
-            evt_e = torch.mlu.Event(enable_timing=True)
-            torch.mlu.synchronize()
-            evt_s.record()
-            with torch.no_grad():
-                fn(*inputs)
-            evt_e.record()
-            torch.mlu.synchronize()
-            return round(evt_s.elapsed_time(evt_e), 6)
-        else:
+        """
+        Return average execution time of fn(*inputs) in ms over 10 steps.
+
+        For CPU: wall-clock average over 10 runs.
+        For CUDA/MLU: torch.profiler with schedule(wait=2, warmup=2, active=10),
+        device_time_us averaged across the 10 active steps.
+        """
+        _WAIT    = 2
+        _WARMUP  = 2
+        _ACTIVE  = 10
+        _TOTAL   = _WAIT + _WARMUP + _ACTIVE
+
+        if device == "cpu":
+            # run TOTAL times; average last ACTIVE
+            for _ in range(_WAIT + _WARMUP):
+                with torch.no_grad():
+                    fn(*inputs)
             t = time.perf_counter()
-            with torch.no_grad():
-                fn(*inputs)
-            return round((time.perf_counter() - t) * 1000.0, 6)
+            for _ in range(_ACTIVE):
+                with torch.no_grad():
+                    fn(*inputs)
+            return round((time.perf_counter() - t) * 1000.0 / _ACTIVE, 6)
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        elif device == "mlu":
+            try:
+                activities.append(torch.profiler.ProfilerActivity.MLU)
+            except AttributeError:
+                pass
+
+        with torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(
+                wait=_WAIT, warmup=_WARMUP, active=_ACTIVE, repeat=1,
+            ),
+            record_shapes=False,
+            with_flops=False,
+        ) as prof:
+            for _ in range(_TOTAL):
+                with torch.no_grad():
+                    fn(*inputs)
+                prof.step()
+
+        # Sum self device time across active steps (µs), average per step → ms
+        total_us = sum(
+            e.self_device_time_total for e in prof.key_averages()
+            if e.self_device_time_total > 0
+        )
+        if total_us > 0:
+            return round(total_us / 1000.0 / _ACTIVE, 6)
+        # Fallback: self CPU time if no device events recorded
+        cpu_us = sum(e.self_cpu_time_total for e in prof.key_averages())
+        return round(cpu_us / 1000.0 / _ACTIVE, 6)
 
     n = len(all_tasks)
-    print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
+    print(f"\n[kernel timing] {n} case(s) — compiled vs eager (sequential) …", flush=True)
     kernel_times: dict[int, float] = {}
     eager_times: dict[int, float] = {}
 
@@ -561,13 +666,15 @@ def _collect_kernel_times(
 
             kernel_times[idx] = _time_fn(compiled, inputs, device)
             eager_times[idx]   = _time_fn(model,    inputs, device)
-        except Exception:
+        except Exception as exc:
             kernel_times[idx] = 0.0
             eager_times[idx]  = 0.0
+            logging.disable(logging.NOTSET)
+            print(f"  [warn] kernel timing failed for {variant_name}: {exc}", flush=True)
         finally:
             logging.disable(logging.NOTSET)
 
-        if (i + 1) % 50 == 0 or (i + 1) == n:
+        if n > 1 and (i + 1) % 50 == 0:
             print(f"  [{i + 1}/{n}]", flush=True)
 
     return kernel_times, eager_times
@@ -617,21 +724,8 @@ _STAT_GROUPS: list[tuple[str, list[str]]] = [
 ]
 
 
-def _write_stats(results: list[BenchResult], out_path: Path) -> None:
-    """
-    Compute max / min / avg for every numeric column across all successful
-    results and:
-      1. Append three summary rows to the CSV (after the data rows).
-      2. Print a grouped summary table to stdout.
-    """
-    if not results:
-        return
-
-    good = [r for r in results if not r.error]
-    if not good:
-        print("\n[stats] No successful results to summarise.")
-        return
-
+def _compute_stats(good: list[BenchResult]) -> dict[str, dict[str, float]]:
+    """Compute max/min/avg for every numeric field plus speedup."""
     numeric_fields = [
         f.name for f in fields(BenchResult)
         if f.name not in _STATS_EXCLUDE and f.type in ("float", "int")
@@ -642,49 +736,41 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
             if f.name not in _STATS_EXCLUDE
             and isinstance(getattr(good[0], f.name), (int, float))
         ]
-
     stats: dict[str, dict[str, float]] = {}
     for col in numeric_fields:
         vals = [getattr(r, col) for r in good]
-        stats[col] = {
-            "max": max(vals),
-            "min": min(vals),
-            "avg": sum(vals) / len(vals),
-        }
-
-    # ── compute speedup (eager / compiled) ───────────────────────────────────
+        stats[col] = {"max": max(vals), "min": min(vals), "avg": sum(vals) / len(vals)}
     speedup_vals = [
         r.eager_time_ms / r.kernel_time_ms
         for r in good
         if r.kernel_time_ms > 0 and r.eager_time_ms > 0
     ]
     if speedup_vals:
-        stats["speedup (eager/compiled)"] = {
+        avg_kernel = stats.get("kernel_time_ms", {}).get("avg", 0.0)
+        avg_eager  = stats.get("eager_time_ms",  {}).get("avg", 0.0)
+        # per-sample ratio stats (max/min meaningful; avg = mean of ratios)
+        stats["speedup per-sample (eager/compiled)"] = {
             "max": max(speedup_vals),
             "min": min(speedup_vals),
             "avg": sum(speedup_vals) / len(speedup_vals),
         }
+        # ratio of averages (more representative overall speedup);
+        # max/min are not meaningful for this aggregate metric
+        stats["speedup avg(eager)/avg(compiled)"] = {
+            "max": None,
+            "min": None,
+            "avg": (avg_eager / avg_kernel) if avg_kernel > 0 else 0.0,
+        }
+    return stats
 
-    # ── append to CSV ────────────────────────────────────────────────────────
-    header = BenchResult.csv_header()
-    with out_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([])
-        for stat_name in ("max", "min", "avg"):
-            row = []
-            for col in header:
-                if col == "sample":
-                    row.append(f"[{stat_name}]")
-                elif col == "device":
-                    row.append("")
-                elif col in stats:
-                    v = stats[col][stat_name]
-                    row.append(f"{v:.6f}" if isinstance(v, float) else v)
-                else:
-                    row.append("")
-            writer.writerow(row)
 
-    # ── build grouped summary table ───────────────────────────────────────────
+def _render_stats_section(
+    stats: dict[str, dict[str, float]],
+    section_title: str,
+    n_good: int,
+    n_total: int,
+) -> str:
+    """Render one grouped stats block (all _STAT_GROUPS) as a string."""
     col_w = 16
     label_w = 32
     total_w = label_w + col_w * 3 + 9
@@ -692,6 +778,11 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
 
     def _emit(line: str = "") -> None:
         buf.write(line + "\n")
+
+    sep = "━" * total_w
+    _emit(f"\n{sep}")
+    _emit(f"  {section_title}  (n={n_good})")
+    _emit(sep)
 
     def _hdr(title: str) -> None:
         _emit(f"\n╔{'═' * (total_w - 2)}╗")
@@ -705,12 +796,15 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
             return
         s = stats[col]
         fmt = f"{{:>{col_w}.6f}}" if is_float else f"{{:>{col_w}.0f}}"
-        _emit(f"║  {label:<{label_w - 2}}  {fmt.format(s['max'])}  {fmt.format(s['min'])}  {fmt.format(s['avg'])} ║")
+        def _fmt(v) -> str:
+            return f"{'--':>{col_w}}" if v is None else fmt.format(v)
+        _emit(f"║  {label:<{label_w - 2}}  {_fmt(s['max'])}  {_fmt(s['min'])}  {_fmt(s['avg'])} ║")
 
     def _footer() -> None:
         _emit(f"╚{'═' * (total_w - 2)}╝")
 
-    has_accuracy = any(r.cosine_sim != 0.0 for r in good)
+    has_accuracy = any(col in stats and stats[col]["max"] != 0.0
+                       for col in ("cosine_sim", "max_abs_err"))
 
     for group_title, cols in _STAT_GROUPS:
         if group_title.startswith("Accuracy") and not has_accuracy:
@@ -719,21 +813,67 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
         for col in cols:
             if col not in stats:
                 continue
-            is_float = isinstance(stats[col]["avg"], float)
-            _row(col, col, is_float)
-            if col == "eager_time_ms" and "speedup (eager/compiled)" in stats:
-                _row("speedup (eager/compiled)", "speedup (eager/compiled)", True)
+            _row(col, col, isinstance(stats[col]["avg"], float))
+            if col == "eager_time_ms":
+                _row("speedup per-sample avg", "speedup per-sample (eager/compiled)", True)
+                _row("speedup avg(eager)/avg(compiled)", "speedup avg(eager)/avg(compiled)", True)
         _footer()
 
-    footer_line = f"\n  n={len(good)} successful cases  |  {len(results) - len(good)} errors"
-    _emit(footer_line)
+    if n_total > n_good:
+        _emit(f"\n  {n_total - n_good} error(s) excluded from statistics")
+
+    return buf.getvalue()
+
+
+def _write_stats(
+    results: list[BenchResult],
+    out_path: Path,
+    sample_to_type: dict[str, str] | None = None,
+) -> None:
+    """
+    Compute statistics and write to <stem>_summary.txt.
+    Stats are grouped by case_type when sample_to_type is provided.
+    No stats rows are appended to the CSV.
+    """
+    if not results:
+        return
+
+    good = [r for r in results if not r.error]
+    if not good:
+        print("\n[stats] No successful results to summarise.")
+        return
+
+    buf = io.StringIO()
+
+    # ── per-case_type sections ────────────────────────────────────────────────
+    if sample_to_type:
+        # group results by case_type, preserving insertion order
+        type_groups: dict[str, list[BenchResult]] = {}
+        for r in good:
+            ct = sample_to_type.get(r.sample, "other")
+            type_groups.setdefault(ct, []).append(r)
+
+        for ct, ct_results in type_groups.items():
+            stats = _compute_stats(ct_results)
+            buf.write(_render_stats_section(
+                stats, ct, len(ct_results),
+                sum(1 for r in results if sample_to_type.get(r.sample) == ct),
+            ))
+
+        # overall section only when there are multiple types
+        if len(type_groups) > 1:
+            stats = _compute_stats(good)
+            buf.write(_render_stats_section(stats, "overall", len(good), len(results)))
+    else:
+        stats = _compute_stats(good)
+        buf.write(_render_stats_section(stats, "overall", len(good), len(results)))
 
     table = buf.getvalue()
 
     # ── print to stdout ───────────────────────────────────────────────────────
     print(table, end="")
 
-    # ── write to summary file alongside the CSV ───────────────────────────────
+    # ── write summary file (stats only, separate from CSV) ───────────────────
     summary_path = out_path.with_name(out_path.stem + "_summary.txt")
     summary_path.write_text(table, encoding="utf-8")
     print(f"Summary written to  : {summary_path.resolve()}")
@@ -929,11 +1069,19 @@ def main(argv: list[str] | None = None) -> None:
             writer.writerow(result.csv_row())
 
     # ── compute and append statistics ───────────────────────────────────────
+    # build sample→case_type map from task list for per-type stats grouping
+    sample_to_type: dict[str, str] = {}
+    for task in all_tasks:
+        _, variant_name, module_path, *_ = task
+        for ct, mod_path in SAMPLES.items():
+            if mod_path == module_path:
+                sample_to_type[variant_name] = ct
+                break
+
     all_results = [ordered_results[i][0] for i in range(n)]
-    _write_stats(all_results, out_path)
+    _write_stats(all_results, out_path, sample_to_type)
 
     print(f"\nResults written to: {out_path.resolve()}")
-    print(f"Per-sample logs  : {logs_dir.resolve()}/")
 
 
 if __name__ == "__main__":

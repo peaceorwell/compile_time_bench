@@ -113,17 +113,19 @@ Parallel workers are each pinned to a dedicated CPU core slice via
 
 | Pass | Purpose |
 |---|---|
-| 5th | Re-compiles using phase-1 disk cache (fast) |
-| 6th | Timed with `torch.cuda.Event.elapsed_time()` — records `kernel_time_ms` |
+| 5th–6th | Warmup (triggers recompile or cache hit) |
+| 7th–16th | Timed with `torch.profiler` — records `kernel_time_ms` (avg over 10 active steps) |
 
 Running phase 2 serially ensures only one kernel executes at a time, giving
 accurate device-side hardware timing.  On CPU, wall-clock is used instead.
 
 ## Statistics
 
-After writing the per-case CSV rows, the benchmark appends three summary rows
-(`[max]`, `[min]`, `[avg]`) for every numeric column, and prints the same
-table to stdout.
+After writing the per-case CSV, the benchmark computes per-group statistics
+(max / min / avg for every numeric column plus speedup metrics) and writes them
+to `<stem>_summary.txt` alongside the CSV.  The same table is printed to
+stdout at the end of the run.  When multiple case types are selected, one
+section per type is shown followed by an overall section.
 
 ## Usage
 
@@ -156,8 +158,8 @@ python benchmark.py --device cpu
 python benchmark.py --backend aot_eager
 ```
 
-Results are written to `compile_times.csv` (configurable via `--output`),
-with `[max]`/`[min]`/`[avg]` summary rows appended at the end.
+Results are written to `compile_times.csv` (configurable via `--output`).
+Statistics are written to `compile_times_summary.txt` and also printed to stdout.
 Per-case `TORCH_LOGS` output is saved under `logs/<case_name>.log`.
 
 ## TORCH_LOGS

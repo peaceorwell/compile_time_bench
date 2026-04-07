@@ -112,16 +112,17 @@ dtype   ∈ {fp32, fp16}
 
 | 次数 | 用途 |
 |---|---|
-| 第 5 次 | 利用第一阶段的磁盘缓存重新编译（速度很快） |
-| 第 6 次 | 用 `torch.cuda.Event.elapsed_time()` 计时 — 记录 `kernel_time_ms` |
+| 第 5–6 次 | 预热（触发重新编译或命中缓存） |
+| 第 7–16 次 | 用 `torch.profiler` 计时 — 记录 `kernel_time_ms`（10 个 active step 取平均） |
 
 第二阶段强制串行，确保每次只有一个 kernel 在设备上执行，保证硬件计时的准确性。
 CPU 设备使用 wall-clock 计时。
 
 ## 统计汇总
 
-写完每个 case 的 CSV 数据行后，benchmark 会在文件末尾追加三行汇总
-（`[max]`、`[min]`、`[avg]`），同时在标准输出打印相同的统计表格。
+写完每个 case 的 CSV 后，benchmark 计算各分组的统计数据（所有数值列的 max / min / avg
+以及加速比指标），结果写入 `<stem>_summary.txt`，同时在终端打印。
+运行多个 case_type 时，每类单独显示一个统计段，最后附一个整体汇总段。
 
 ## 使用方法
 
@@ -154,8 +155,8 @@ python benchmark.py --device cpu
 python benchmark.py --backend aot_eager
 ```
 
-结果写入 `compile_times.csv`（可通过 `--output` 修改），
-文件末尾自动追加 `[max]`/`[min]`/`[avg]` 汇总行。
+结果写入 `compile_times.csv`（可通过 `--output` 修改）。
+统计数据写入 `compile_times_summary.txt`，同时在终端打印。
 各 case 的 `TORCH_LOGS` 输出保存在 `logs/<case_name>.log`。
 
 ## TORCH_LOGS
