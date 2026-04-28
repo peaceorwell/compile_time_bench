@@ -24,12 +24,15 @@ results/              – suggested directory for output CSV files
 
 | Column | Description |
 |---|---|
-| `first_call_s` | Wall-clock time of the **first** forward pass (triggers full compilation) |
-| `second_call_s` | Wall-clock time of the **second** forward pass (compiled artifact reused) |
-| `dynamo_s` | Dynamo phase: Python bytecode tracing + guard building |
-| `aot_s` | AOT Autograd phase: joint graph lowering and metadata collection |
-| `backend_s` | Inductor backend: full codegen + kernel compilation |
-| `total_compile_s` | Total compile time (`_compile.compile_inner` wall-clock) |
+| `repeats` | Number of compilation samples collected for the case |
+| `first_call_s` | Median wall-clock time of the **first** forward pass (triggers full compilation) |
+| `first_call_min_s` / `first_call_max_s` | Min/max first-call wall-clock time across repeats |
+| `second_call_s` | Median wall-clock time of the **second** forward pass (compiled artifact reused) |
+| `dynamo_s` | Median Dynamo phase: Python bytecode tracing + guard building |
+| `aot_s` | Median AOT Autograd phase: joint graph lowering and metadata collection |
+| `backend_s` | Median Inductor backend: full codegen + kernel compilation |
+| `total_compile_s` | Median total compile time (`_compile.compile_inner` wall-clock) |
+| `total_compile_min_s` / `total_compile_max_s` | Min/max total compile time across repeats |
 | `inductor_codegen_s` | Inductor sub-phase: `GraphLowering.codegen` (IR → C++/Triton) |
 | `inductor_compile_s` | Inductor sub-phase: `compile_file` (C++/Triton → `.so`) |
 | `inductor_load_s` | Inductor sub-phase: `PyCodeCache.load_by_key_path` (load compiled kernel) |
@@ -95,13 +98,14 @@ dtype   ∈ {fp32, fp16}
 
 ## Execution phases
 
-Each case runs a total of **6 forward passes** across two sequential phases:
+Each case runs repeated compilation samples in phase 1 (controlled by
+`--repeats`, default `1`) plus an optional kernel timing phase.
 
 **Phase 1 — Compilation benchmark** (supports `--workers N` for parallelism)
 
 | Pass | Purpose |
 |---|---|
-| 1st | Triggers `torch.compile` — records `first_call_s` and all compile-phase metrics |
+| 1st | Triggers `torch.compile` — records one sample for `first_call_s` and all compile-phase metrics |
 | 2nd | Reuses compiled artifact — records `second_call_s` |
 | 3rd | Eager forward — accuracy reference |
 | 4th | Compiled forward — accuracy comparison → `max_abs_err`, `cosine_sim`, … |
@@ -113,11 +117,13 @@ Parallel workers are each pinned to a dedicated CPU core slice via
 
 | Pass | Purpose |
 |---|---|
-| 5th | Re-compiles using phase-1 disk cache (fast) |
+| 5th | Re-compiles / warms the compiled callable in the main process |
 | 6th | Timed with `torch.cuda.Event.elapsed_time()` — records `kernel_time_ms` |
 
 Running phase 2 serially ensures only one kernel executes at a time, giving
 accurate device-side hardware timing.  On CPU, wall-clock is used instead.
+If kernel timing fails for a case, the failure is recorded as an error rather
+than being reported as a `0.0 ms` measurement.
 
 ## Statistics
 
@@ -145,6 +151,10 @@ python benchmark.py --case_type elementwise \
 
 # Parallel compilation across N worker processes (kernel timing is always serial)
 python benchmark.py --workers 4
+
+# More stable compile-only GEMM timing: serial, repeated, isolated caches
+python benchmark.py --case_type gemm --workers 1 --repeats 5 \
+    --skip-kernel-timing --isolate-cache
 
 # Custom output path
 python benchmark.py --output results/my_run.csv

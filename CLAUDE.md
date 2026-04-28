@@ -16,7 +16,9 @@ results/              – suggested directory for output CSV files
 ## Key Concepts
 
 - Two-phase execution: **Phase 1** (compilation + accuracy, supports `--workers N`) then **Phase 2** (kernel timing, always serial in main process)
-- Phase 1 uses `_reset_all_caches()` before each case; Phase 2 reuses Phase 1 disk cache
+- Phase 1 uses `_reset_all_caches()` before each case; Phase 2 recompiles / warms each compiled callable in the main process before timing
+- `--repeats N` repeats compilation sampling per case and reports medians plus min/max for key compile columns
+- `--skip-kernel-timing` supports compile-only runs; `--isolate-cache` gives each invocation fresh Inductor/Triton cache dirs
 - Compile-phase metrics extracted from `torch._dynamo.utils.compilation_time_metrics`
 - Accuracy: compiled output vs. eager output, cast to fp32, metrics: max_abs_err, mean_abs_err, max_rel_err, cosine_sim
 - Kernel timing: `torch.{cuda,mlu}.Event.elapsed_time()` (device) or wall-clock (CPU)

@@ -23,12 +23,15 @@ results/              – CSV 结果文件的建议存放目录
 
 | 列名 | 说明 |
 |---|---|
-| `first_call_s` | **第 1 次**前向推理的 wall-clock 耗时（触发完整编译） |
-| `second_call_s` | **第 2 次**前向推理的 wall-clock 耗时（复用已编译产物） |
-| `dynamo_s` | Dynamo 阶段：Python 字节码 tracing + guard 构建 |
-| `aot_s` | AOT Autograd 阶段：联合图 lowering 和 metadata 收集 |
-| `backend_s` | Inductor backend：完整 codegen + kernel 编译 |
-| `total_compile_s` | 编译总耗时（`_compile.compile_inner` wall-clock） |
+| `repeats` | 每个 case 采集的编译样本数量 |
+| `first_call_s` | **第 1 次**前向推理的 median wall-clock 耗时（触发完整编译） |
+| `first_call_min_s` / `first_call_max_s` | 多次采样中的 first-call 最小/最大 wall-clock 耗时 |
+| `second_call_s` | **第 2 次**前向推理的 median wall-clock 耗时（复用已编译产物） |
+| `dynamo_s` | Dynamo 阶段 median：Python 字节码 tracing + guard 构建 |
+| `aot_s` | AOT Autograd 阶段 median：联合图 lowering 和 metadata 收集 |
+| `backend_s` | Inductor backend median：完整 codegen + kernel 编译 |
+| `total_compile_s` | 编译总耗时 median（`_compile.compile_inner` wall-clock） |
+| `total_compile_min_s` / `total_compile_max_s` | 多次采样中的编译总耗时最小/最大值 |
 | `inductor_codegen_s` | Inductor 子阶段：`GraphLowering.codegen`（IR → C++/Triton） |
 | `inductor_compile_s` | Inductor 子阶段：`compile_file`（C++/Triton → `.so`） |
 | `inductor_load_s` | Inductor 子阶段：`PyCodeCache.load_by_key_path`（加载编译后的 kernel） |
@@ -94,13 +97,14 @@ dtype   ∈ {fp32, fp16}
 
 ## 执行阶段
 
-每个 case 共执行 **6 次前向推理**，分布在两个顺序执行的阶段：
+每个 case 在第一阶段可重复采集多次编译样本（由 `--repeats` 控制，默认 `1`），
+并可选择执行第二阶段 kernel 计时。
 
 **第一阶段 — 编译 benchmark**（支持 `--workers N` 并行）
 
 | 次数 | 用途 |
 |---|---|
-| 第 1 次 | 触发 `torch.compile` — 记录 `first_call_s` 及所有编译阶段指标 |
+| 第 1 次 | 触发 `torch.compile` — 采集一次 `first_call_s` 及所有编译阶段指标 |
 | 第 2 次 | 复用已编译产物 — 记录 `second_call_s` |
 | 第 3 次 | eager 前向推理 — 精度对比的参考值 |
 | 第 4 次 | compiled 前向推理 — 精度对比 → `max_abs_err`、`cosine_sim` 等 |
@@ -112,11 +116,13 @@ dtype   ∈ {fp32, fp16}
 
 | 次数 | 用途 |
 |---|---|
-| 第 5 次 | 利用第一阶段的磁盘缓存重新编译（速度很快） |
+| 第 5 次 | 在主进程重新编译 / 预热 compiled callable |
 | 第 6 次 | 用 `torch.cuda.Event.elapsed_time()` 计时 — 记录 `kernel_time_ms` |
 
 第二阶段强制串行，确保每次只有一个 kernel 在设备上执行，保证硬件计时的准确性。
 CPU 设备使用 wall-clock 计时。
+如果某个 case 的 kernel 计时失败，benchmark 会把它记录为错误，而不是写成
+`0.0 ms` 测量值。
 
 ## 统计汇总
 
@@ -143,6 +149,10 @@ python benchmark.py --case_type elementwise \
 
 # 并行编译（kernel 耗时采集始终串行）
 python benchmark.py --workers 4
+
+# 更稳定地测 GEMM 编译耗时：串行、多次采样、隔离 cache、跳过 kernel 计时
+python benchmark.py --case_type gemm --workers 1 --repeats 5 \
+    --skip-kernel-timing --isolate-cache
 
 # 自定义输出路径
 python benchmark.py --output results/my_run.csv
