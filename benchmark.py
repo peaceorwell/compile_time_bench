@@ -24,8 +24,10 @@ import io
 import logging
 import multiprocessing as mp
 import os
+import statistics
 import sys
 import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -250,8 +252,11 @@ def _read_compile_times() -> dict[str, float]:
 class BenchResult:
     sample: str = ""
     device: str = ""
+    repeats: int = 1
     # wall-clock time for the *first* forward pass (includes compilation)
     first_call_s: float = 0.0
+    first_call_min_s: float = 0.0
+    first_call_max_s: float = 0.0
     # wall-clock time for the *second* forward pass (compiled artifact reused)
     second_call_s: float = 0.0
     # ── high-level compile-phase breakdown ──────────────────────────────────
@@ -259,6 +264,8 @@ class BenchResult:
     aot_s: float = 0.0              # AOT Autograd (joint graph lowering)
     backend_s: float = 0.0          # Inductor: full codegen + compilation
     total_compile_s: float = 0.0    # _compile.compile_inner (wall total)
+    total_compile_min_s: float = 0.0
+    total_compile_max_s: float = 0.0
     # ── Inductor sub-phases ─────────────────────────────────────────────────
     inductor_codegen_s: float = 0.0    # GraphLowering.codegen
     inductor_compile_s: float = 0.0    # compile_file (kernel compilation)
@@ -342,88 +349,146 @@ def _run_sample(
     device: str,
     backend: str = "inductor",
     compute_accuracy: bool = False,
+    repeats: int = 1,
 ) -> tuple[BenchResult, str]:
     """Compile and run one sample; return (BenchResult, captured_logs)."""
-    result = BenchResult(sample=name, device=device)
+    result = BenchResult(sample=name, device=device, repeats=repeats)
+    repeated: list[BenchResult] = []
+    all_logs: list[str] = []
 
-    # Full cache reset: Dynamo frame cache, Inductor PyCodeCache,
-    # FxGraphCache, AOTAutogradCache – all layers cleared before each run.
-    _reset_all_caches()
+    for repeat_idx in range(repeats):
+        run = BenchResult(sample=name, device=device, repeats=1)
 
-    log_buf = io.StringIO()
-    handlers = _attach_capture_handler(log_buf)
+        # Full cache reset: Dynamo frame cache, Inductor PyCodeCache,
+        # FxGraphCache, AOTAutogradCache – all layers cleared before each run.
+        _reset_all_caches()
 
-    try:
-        model, inputs = get_model_and_input(device=device)
-        model.eval()
+        log_buf = io.StringIO()
+        handlers = _attach_capture_handler(log_buf)
 
-        compiled = torch.compile(model, backend=backend, fullgraph=False)
+        try:
+            model, inputs = get_model_and_input(device=device)
+            model.eval()
 
-        # ── first call: triggers full compilation ──
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
-        result.first_call_s = time.perf_counter() - t0
+            compiled = torch.compile(model, backend=backend, fullgraph=False)
 
-        # ── second call: compiled artifact is reused ──────────────────────
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
-        t1 = time.perf_counter()
-        with torch.no_grad():
-            compiled(*inputs)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mlu":
-            torch.mlu.synchronize()
-        result.second_call_s = time.perf_counter() - t1
-        # kernel_time_ms is left as 0.0 here; filled in by _collect_kernel_times
-        # after the main benchmark pass so that parallel runs don't cause
-        # concurrent kernel execution that skews hardware timing.
-
-        # ── collect compile-phase timings ──
-        ct = _read_compile_times()
-        result.dynamo_s = ct["dynamo_s"]
-        result.aot_s = ct["aot_s"]
-        result.backend_s = ct["backend_s"]
-        result.total_compile_s = ct["total_compile_s"]
-        result.inductor_codegen_s = ct["inductor_codegen_s"]
-        result.inductor_compile_s = ct["inductor_compile_s"]
-        result.inductor_load_s = ct["inductor_load_s"]
-        result.pre_grad_passes_s = ct["pre_grad_passes_s"]
-        result.post_grad_passes_s = ct["post_grad_passes_s"]
-        result.joint_graph_passes_s = ct["joint_graph_passes_s"]
-        result.cache_hit = ct["cache_hit"]
-
-        # ── accuracy: compiled vs eager ──────────────────────────────────────
-        if compute_accuracy:
+            # ── first call: triggers full compilation ──
+            t0 = time.perf_counter()
             with torch.no_grad():
-                eager_out    = model(*inputs)
-                compiled_out = compiled(*inputs)
-            (result.max_abs_err,
-             result.mean_abs_err,
-             result.max_rel_err,
-             result.cosine_sim) = _compute_accuracy(eager_out, compiled_out)
+                compiled(*inputs)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elif device == "mlu":
+                torch.mlu.synchronize()
+            run.first_call_s = time.perf_counter() - t0
 
-        # ── frame / graph-break counters ──
-        metrics = getattr(_dynamo_utils, "compilation_time_metrics", {})
-        result.frames_compiled = len(metrics.get("_compile.compile_inner", []))
+            # ── second call: compiled artifact is reused ──────────────────
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elif device == "mlu":
+                torch.mlu.synchronize()
+            t1 = time.perf_counter()
+            with torch.no_grad():
+                compiled(*inputs)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elif device == "mlu":
+                torch.mlu.synchronize()
+            run.second_call_s = time.perf_counter() - t1
+            # kernel_time_ms is left as 0.0 here; filled in by
+            # _collect_kernel_times after the main benchmark pass.
 
-        logs = log_buf.getvalue()
-        result.graph_breaks = logs.count("Graph break")
+            # ── collect compile-phase timings ──
+            ct = _read_compile_times()
+            run.dynamo_s = ct["dynamo_s"]
+            run.aot_s = ct["aot_s"]
+            run.backend_s = ct["backend_s"]
+            run.total_compile_s = ct["total_compile_s"]
+            run.inductor_codegen_s = ct["inductor_codegen_s"]
+            run.inductor_compile_s = ct["inductor_compile_s"]
+            run.inductor_load_s = ct["inductor_load_s"]
+            run.pre_grad_passes_s = ct["pre_grad_passes_s"]
+            run.post_grad_passes_s = ct["post_grad_passes_s"]
+            run.joint_graph_passes_s = ct["joint_graph_passes_s"]
+            run.cache_hit = ct["cache_hit"]
 
-    except Exception as exc:  # noqa: BLE001
-        result.error = str(exc)
-        logs = log_buf.getvalue()
-    finally:
-        _detach_capture_handler(handlers)
+            # ── accuracy: compiled vs eager ────────────────────────────────
+            if compute_accuracy and repeat_idx == 0:
+                with torch.no_grad():
+                    eager_out    = model(*inputs)
+                    compiled_out = compiled(*inputs)
+                (run.max_abs_err,
+                 run.mean_abs_err,
+                 run.max_rel_err,
+                 run.cosine_sim) = _compute_accuracy(eager_out, compiled_out)
 
-    return result, logs
+            # ── frame / graph-break counters ──
+            metrics = getattr(_dynamo_utils, "compilation_time_metrics", {})
+            run.frames_compiled = len(metrics.get("_compile.compile_inner", []))
+
+            run.graph_breaks = log_buf.getvalue().count("Graph break")
+            repeated.append(run)
+
+        except Exception as exc:  # noqa: BLE001
+            run.error = str(exc)
+            repeated.append(run)
+            break
+        finally:
+            _detach_capture_handler(handlers)
+            logs = log_buf.getvalue()
+            if repeats == 1:
+                all_logs.append(logs)
+            else:
+                all_logs.append(f"===== repeat {repeat_idx + 1}/{repeats} =====\n{logs}")
+
+    good = [r for r in repeated if not r.error]
+    if not good:
+        result.error = repeated[-1].error if repeated else "no repeat completed"
+        return result, "".join(all_logs)
+
+    def _median_attr(attr: str) -> float:
+        return round(float(statistics.median(getattr(r, attr) for r in good)), 6)
+
+    def _min_attr(attr: str) -> float:
+        return round(float(min(getattr(r, attr) for r in good)), 6)
+
+    def _max_attr(attr: str) -> float:
+        return round(float(max(getattr(r, attr) for r in good)), 6)
+
+    result.first_call_s = _median_attr("first_call_s")
+    result.first_call_min_s = _min_attr("first_call_s")
+    result.first_call_max_s = _max_attr("first_call_s")
+    result.second_call_s = _median_attr("second_call_s")
+    result.dynamo_s = _median_attr("dynamo_s")
+    result.aot_s = _median_attr("aot_s")
+    result.backend_s = _median_attr("backend_s")
+    result.total_compile_s = _median_attr("total_compile_s")
+    result.total_compile_min_s = _min_attr("total_compile_s")
+    result.total_compile_max_s = _max_attr("total_compile_s")
+    result.inductor_codegen_s = _median_attr("inductor_codegen_s")
+    result.inductor_compile_s = _median_attr("inductor_compile_s")
+    result.inductor_load_s = _median_attr("inductor_load_s")
+    result.pre_grad_passes_s = _median_attr("pre_grad_passes_s")
+    result.post_grad_passes_s = _median_attr("post_grad_passes_s")
+    result.joint_graph_passes_s = _median_attr("joint_graph_passes_s")
+    result.cache_hit = max(r.cache_hit for r in good)
+    result.graph_breaks = max(r.graph_breaks for r in good)
+    result.frames_compiled = int(statistics.median(r.frames_compiled for r in good))
+
+    acc = next((r for r in good if r.cosine_sim != 0.0), None)
+    if acc is not None:
+        result.max_abs_err = acc.max_abs_err
+        result.mean_abs_err = acc.mean_abs_err
+        result.max_rel_err = acc.max_rel_err
+        result.cosine_sim = acc.cosine_sim
+
+    if len(good) < repeats:
+        failed = next((r for r in repeated if r.error), None)
+        result.error = f"only {len(good)}/{repeats} repeats completed"
+        if failed is not None:
+            result.error += f": {failed.error}"
+
+    return result, "".join(all_logs)
 
 
 # ── subprocess worker (module-level so it is picklable) ──────────────────────
@@ -469,7 +534,8 @@ def _worker(task: tuple) -> tuple[int, dict, str]:
     """
     Entry point for each ProcessPoolExecutor worker.
 
-    task = (idx, variant_name, module_path, fn_kwargs, device, backend)
+    task = (idx, variant_name, module_path, fn_kwargs, device, backend,
+            compute_accuracy, repeats)
 
     All elements are plain picklable values.  The worker imports the sample
     module (which is a no-op after fork since it is already in sys.modules),
@@ -477,7 +543,7 @@ def _worker(task: tuple) -> tuple[int, dict, str]:
     to _run_sample.  Returns (idx, result_as_dict, captured_logs) so the
     main process can reconstruct a BenchResult and maintain submission order.
     """
-    idx, variant_name, module_path, fn_kwargs, device, backend, compute_accuracy = task
+    idx, variant_name, module_path, fn_kwargs, device, backend, compute_accuracy, repeats = task
 
     import importlib
     mod = importlib.import_module(module_path)
@@ -485,7 +551,7 @@ def _worker(task: tuple) -> tuple[int, dict, str]:
     def get_fn(device: str = "cpu"):
         return mod.get_model_and_input(**fn_kwargs, device=device)
 
-    result, logs = _run_sample(variant_name, get_fn, device, backend, compute_accuracy)
+    result, logs = _run_sample(variant_name, get_fn, device, backend, compute_accuracy, repeats)
     return idx, asdict(result), logs
 
 
@@ -495,7 +561,7 @@ def _collect_kernel_times(
     all_tasks: list[tuple],
     device: str,
     backend: str,
-) -> tuple[dict[int, float], dict[int, float]]:
+) -> tuple[dict[int, float], dict[int, float], dict[int, str]]:
     """
     Re-run every case sequentially in the main process and measure hardware
     kernel execution time for both compiled and eager (non-compiled) modes
@@ -505,7 +571,9 @@ def _collect_kernel_times(
     parallel workers (--workers > 1) do not execute kernels concurrently,
     which would skew device-side timing.
 
-    Returns (kernel_times, eager_times) — both indexed by task idx (ms).
+    Returns (kernel_times, eager_times, errors) — all indexed by task idx.
+    Timing values are milliseconds.  Errors are kept separate so callers do
+    not mistake failed timing runs for valid 0 ms measurements.
     TORCH_LOGS output is suppressed to keep the output clean.
     """
     import importlib
@@ -542,9 +610,10 @@ def _collect_kernel_times(
     print(f"\n[kernel timing] {n} cases — compiled vs eager (sequential) …", flush=True)
     kernel_times: dict[int, float] = {}
     eager_times: dict[int, float] = {}
+    errors: dict[int, str] = {}
 
     for i, task in enumerate(all_tasks):
-        idx, variant_name, module_path, fn_kwargs, device_, backend_, _ = task
+        idx, variant_name, module_path, fn_kwargs, device_, backend_, _, _ = task
         logging.disable(logging.CRITICAL)
         try:
             mod = importlib.import_module(module_path)
@@ -561,16 +630,15 @@ def _collect_kernel_times(
 
             kernel_times[idx] = _time_fn(compiled, inputs, device)
             eager_times[idx]   = _time_fn(model,    inputs, device)
-        except Exception:
-            kernel_times[idx] = 0.0
-            eager_times[idx]  = 0.0
+        except Exception as exc:  # noqa: BLE001
+            errors[idx] = f"{type(exc).__name__}: {exc}"
         finally:
             logging.disable(logging.NOTSET)
 
         if (i + 1) % 50 == 0 or (i + 1) == n:
             print(f"  [{i + 1}/{n}]", flush=True)
 
-    return kernel_times, eager_times
+    return kernel_times, eager_times, errors
 
 
 # ── statistics helpers ────────────────────────────────────────────────────────
@@ -587,6 +655,8 @@ _STAT_GROUPS: list[tuple[str, list[str]]] = [
     ]),
     ("Compilation (s)", [
         "total_compile_s",
+        "total_compile_min_s",
+        "total_compile_max_s",
         "dynamo_s",
         "aot_s",
         "backend_s",
@@ -601,9 +671,12 @@ _STAT_GROUPS: list[tuple[str, list[str]]] = [
     ]),
     ("Wall-clock (s)", [
         "first_call_s",
+        "first_call_min_s",
+        "first_call_max_s",
         "second_call_s",
     ]),
     ("Counters", [
+        "repeats",
         "cache_hit",
         "graph_breaks",
         "frames_compiled",
@@ -617,7 +690,11 @@ _STAT_GROUPS: list[tuple[str, list[str]]] = [
 ]
 
 
-def _write_stats(results: list[BenchResult], out_path: Path) -> None:
+def _write_stats(
+    results: list[BenchResult],
+    out_path: Path,
+    include_performance: bool = True,
+) -> None:
     """
     Compute max / min / avg for every numeric column across all successful
     results and:
@@ -713,6 +790,8 @@ def _write_stats(results: list[BenchResult], out_path: Path) -> None:
     has_accuracy = any(r.cosine_sim != 0.0 for r in good)
 
     for group_title, cols in _STAT_GROUPS:
+        if group_title.startswith("Performance") and not include_performance:
+            continue
         if group_title.startswith("Accuracy") and not has_accuracy:
             continue
         _hdr(group_title)
@@ -747,6 +826,27 @@ SAMPLES: dict[str, str] = {
 }
 
 
+def _configure_isolated_cache_dirs() -> Path:
+    """Give this benchmark process tree a private Inductor/Triton cache root."""
+    root = Path("/tmp") / "compile_time_bench_cache" / uuid.uuid4().hex
+    inductor_dir = root / "inductor"
+    triton_dir = root / "triton"
+    inductor_dir.mkdir(parents=True, exist_ok=True)
+    triton_dir.mkdir(parents=True, exist_ok=True)
+
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor_dir)
+    os.environ["TRITON_CACHE_DIR"] = str(triton_dir)
+
+    try:
+        import torch._inductor.config as _inductor_cfg
+        if hasattr(_inductor_cfg, "cache_dir"):
+            _inductor_cfg.cache_dir = str(inductor_dir)
+    except Exception:
+        pass
+
+    return root
+
+
 def _print_row(result: BenchResult) -> None:
     if result.error:
         print(f"{result.sample:<44} ERROR: {result.error}")
@@ -768,12 +868,14 @@ def _build_tasks(
     device: str,
     backend: str,
     variants_filter: set[str] | None = None,
+    repeats: int = 1,
 ) -> list[tuple]:
     """
     Build the flat task list from all requested samples.
 
     Each task is a picklable tuple:
-        (idx, variant_name, module_path, fn_kwargs, device, backend, compute_accuracy)
+        (idx, variant_name, module_path, fn_kwargs, device, backend,
+         compute_accuracy, repeats)
 
     Modules that expose get_variant_specs() are expanded into one task per
     variant.  All others produce a single task with fn_kwargs={}.
@@ -797,7 +899,7 @@ def _build_tasks(
             if variants_filter is None or variant_name in variants_filter:
                 tasks.append((
                     len(tasks), variant_name, module_path,
-                    fn_kwargs, device, backend, compute_accuracy,
+                    fn_kwargs, device, backend, compute_accuracy, repeats,
                 ))
     return tasks
 
@@ -820,7 +922,22 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--case_name", nargs="+", default=None, metavar="CASE_NAME",
                         help="Run only these specific variant names, e.g. "
                              "elementwise_ni2_no1_sz256_2d_high (default: run all)")
+    parser.add_argument("--repeats", type=int, default=1,
+                        help="Compile each case this many times and report medians (default: 1)")
+    parser.add_argument("--skip-kernel-timing", action="store_true",
+                        help="Skip the serial kernel timing phase; useful for compile-only runs")
+    parser.add_argument("--isolate-cache", action="store_true",
+                        help="Use a fresh /tmp Inductor/Triton cache directory for this run")
     args = parser.parse_args(argv)
+
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+    if args.repeats < 1:
+        parser.error("--repeats must be >= 1")
+
+    if args.isolate_cache:
+        cache_root = _configure_isolated_cache_dirs()
+        print(f"[cache] isolated cache root: {cache_root}", flush=True)
 
     if args.device is None:
         args.device = _detect_device()
@@ -841,21 +958,28 @@ def main(argv: list[str] | None = None) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     variants_filter = set(args.case_name) if args.case_name else None
-    all_tasks = _build_tasks(args.case_type, args.device, args.backend, variants_filter)
+    all_tasks = _build_tasks(
+        args.case_type, args.device, args.backend, variants_filter, args.repeats
+    )
+
+    if variants_filter:
+        known = _build_tasks(args.case_type, args.device, args.backend, repeats=args.repeats)
+        known_names = {t[1] for t in known}
+        unmatched = variants_filter - known_names
+        if unmatched:
+            print(f"[error] Unknown case_name(s): {sorted(unmatched)}", file=sys.stderr)
+            print(f"        Available case names in selected case types ({len(known_names)}):", file=sys.stderr)
+            for name in sorted(known_names)[:10]:
+                print(f"          {name}", file=sys.stderr)
+            if len(known_names) > 10:
+                print(f"          ... ({len(known_names) - 10} more)", file=sys.stderr)
+            sys.exit(1)
+
+    if not all_tasks:
+        parser.error("no benchmark cases selected")
 
     _warmup(args.device)
 
-    if variants_filter and not all_tasks:
-        known = _build_tasks(args.case_type, args.device, args.backend)
-        known_names = [t[1] for t in known]
-        unmatched = variants_filter - {t[1] for t in known}
-        print(f"[error] No case_name matched: {sorted(unmatched)}", file=sys.stderr)
-        print(f"        Available case names in selected case types ({len(known_names)}):", file=sys.stderr)
-        for name in known_names[:10]:
-            print(f"          {name}", file=sys.stderr)
-        if len(known_names) > 10:
-            print(f"          ... ({len(known_names) - 10} more)", file=sys.stderr)
-        sys.exit(1)
     n = len(all_tasks)
 
     print(f"{'Sample':<44} {'Dev':<5} {'1st call':>9} {'2nd call':>9}"
@@ -868,13 +992,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.workers == 1:
         # ── sequential: run directly in the main process, no subprocess ─────
         import importlib
-        for idx, variant_name, module_path, fn_kwargs, device, backend, compute_accuracy in all_tasks:
+        for idx, variant_name, module_path, fn_kwargs, device, backend, compute_accuracy, repeats in all_tasks:
             mod = importlib.import_module(module_path)
 
             def get_fn(device: str = device, _mod=mod, _kw=fn_kwargs):
                 return _mod.get_model_and_input(**_kw, device=device)
 
-            result, logs = _run_sample(variant_name, get_fn, device, backend, compute_accuracy)
+            result, logs = _run_sample(variant_name, get_fn, device, backend, compute_accuracy, repeats)
             ordered_results[idx] = (result, logs)
             _print_row(result)
             (logs_dir / f"{result.sample}.log").write_text(logs, encoding="utf-8")
@@ -911,16 +1035,23 @@ def main(argv: list[str] | None = None) -> None:
                 _print_row(result)
                 (logs_dir / f"{result.sample}.log").write_text(logs, encoding="utf-8")
 
-    # ── sequential kernel timing pass ───────────────────────────────────────
-    # Always runs in the main process (single kernel at a time) so that
-    # device-side event clocks are not disturbed by concurrent kernels.
-    kernel_times, eager_times = _collect_kernel_times(all_tasks, args.device, args.backend)
-    for idx in range(n):
-        ordered_results[idx][0].kernel_time_ms = kernel_times.get(idx, 0.0)
-        ordered_results[idx][0].eager_time_ms  = eager_times.get(idx, 0.0)
+    if not args.skip_kernel_timing:
+        # ── sequential kernel timing pass ───────────────────────────────────
+        # Always runs in the main process (single kernel at a time) so that
+        # device-side event clocks are not disturbed by concurrent kernels.
+        timing_tasks = [task for task in all_tasks if not ordered_results[task[0]][0].error]
+        kernel_times, eager_times, kernel_errors = _collect_kernel_times(
+            timing_tasks, args.device, args.backend
+        )
+        for idx in range(n):
+            ordered_results[idx][0].kernel_time_ms = kernel_times.get(idx, 0.0)
+            ordered_results[idx][0].eager_time_ms  = eager_times.get(idx, 0.0)
+            if idx in kernel_errors and not ordered_results[idx][0].error:
+                ordered_results[idx][0].error = f"kernel timing failed: {kernel_errors[idx]}"
 
     # ── write CSV in submission order ───────────────────────────────────────
     out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(BenchResult.csv_header())
@@ -930,7 +1061,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # ── compute and append statistics ───────────────────────────────────────
     all_results = [ordered_results[i][0] for i in range(n)]
-    _write_stats(all_results, out_path)
+    _write_stats(all_results, out_path, include_performance=not args.skip_kernel_timing)
 
     print(f"\nResults written to: {out_path.resolve()}")
     print(f"Per-sample logs  : {logs_dir.resolve()}/")
